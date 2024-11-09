@@ -81,6 +81,7 @@ class AnimeDataset(Dataset):
             raise RuntimeError(f"Could not access network path: {network_path}")
 
         self.root_dir = Path(network_path)
+        self.image_size = image_size
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -94,6 +95,37 @@ class AnimeDataset(Dataset):
 
         logger.info("Scanning network directory for images...")
         self._scan_directories()
+        self._validate_images()  # New validation step
+
+    def _is_valid_image(self, path: Path) -> bool:
+        """Check if file is a valid image"""
+        try:
+            with Image.open(path) as img:
+                img.verify()  # Verify it's an image
+                # Try to load it as RGB
+                img = Image.open(path).convert('RGB')
+                return True
+        except Exception as e:
+            logger.warning(f"Invalid image file {path}: {str(e)}")
+            return False
+
+    def _validate_images(self):
+        """Validate all images and remove invalid ones"""
+        valid_paths = []
+        valid_labels = []
+
+        logger.info("Validating images...")
+        for idx, (path, label) in enumerate(zip(self.image_paths, self.labels)):
+            if self._is_valid_image(path):
+                valid_paths.append(path)
+                valid_labels.append(label)
+
+            if idx % 100 == 0:  # Log progress
+                logger.info(f"Validated {idx + 1}/{len(self.image_paths)} images")
+
+        self.image_paths = valid_paths
+        self.labels = valid_labels
+        logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
 
     def _scan_directories(self):
         """Scan directories with error handling for network issues"""
@@ -112,6 +144,9 @@ class AnimeDataset(Dataset):
                                 self.image_paths.append(img_path)
                                 self.labels.append(self.label_to_idx[label])
 
+            if not self.image_paths:
+                raise RuntimeError("No images found in the specified directory")
+
             logger.info(f"Found {len(self.image_paths)} images across {len(self.label_to_idx)} categories")
 
         except Exception as e:
@@ -123,18 +158,32 @@ class AnimeDataset(Dataset):
         for attempt in range(max_retries):
             try:
                 img_path = self.image_paths[idx]
-                image = Image.open(img_path).convert('RGB')
-                image = self.transform(image)
-                label = self.labels[idx]
-                return image, label
+
+                # Open and validate image
+                with Image.open(img_path) as img:
+                    # Convert to RGB first
+                    img = img.convert('RGB')
+
+                    # Apply transformations
+                    image = self.transform(img)
+
+                    label = self.labels[idx]
+                    return image, label
+
             except (OSError, PermissionError) as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to load image {img_path}: {str(e)}")
                 if attempt == max_retries - 1:
                     logger.error(f"Failed to load image after {max_retries} attempts: {img_path}")
-                    # Return a random valid index instead
-                    return self.__getitem__(np.random.randint(self.__len__()))
+                    # Return a different valid index instead
+                    new_idx = (idx + 1) % len(self)
+                    return self.__getitem__(new_idx)
+                time.sleep(1)  # Wait before retry
+            except Exception as e:
+                logger.error(f"Unexpected error loading image {img_path}: {str(e)}")
+                new_idx = (idx + 1) % len(self)
+                return self.__getitem__(new_idx)
 
     def __len__(self):
-        """Return the total number of images in the dataset"""
         return len(self.image_paths)
 
 class TrainingMonitor:
