@@ -381,6 +381,34 @@ class AnimeGeneratorTrainer:
             logger.info(f"GPU Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
             logger.info(f"GPU Memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
 
+    def monitor_training_health(self, g_loss, d_loss, epoch, batch_idx):
+        """Monitor training health and provide warnings"""
+        warnings = []
+
+        # Check discriminator strength
+        if d_loss < 0.1:
+            warnings.append("Warning: Discriminator may be too strong")
+        elif d_loss > 2.0:
+            warnings.append("Warning: Discriminator may be too weak")
+
+        # Check generator performance
+        if g_loss > 5.0:
+            warnings.append("Warning: Generator loss too high")
+        elif g_loss < 0.1:
+            warnings.append("Warning: Possible mode collapse")
+
+        # Check loss ratio
+        loss_ratio = g_loss / (d_loss + 1e-8)
+        if loss_ratio > 30:
+            warnings.append("Warning: Generator/Discriminator loss ratio too high")
+        elif loss_ratio < 0.1:
+            warnings.append("Warning: Generator/Discriminator loss ratio too low")
+
+        if warnings:
+            logger.warning(f"Epoch {epoch}, Batch {batch_idx}: {'; '.join(warnings)}")
+
+        return len(warnings) == 0  # Return True if training looks healthy
+
     def generate_samples(self, num_samples, labels):
         self.generator.eval()
         with torch.no_grad():
@@ -513,10 +541,26 @@ class AnimeGeneratorTrainer:
                 if batch_idx % 10 == 0:
                     self.monitor.update(g_loss.item(), d_loss.item())
 
+                    # Add health monitoring here
+                    training_healthy = self.monitor_training_health(
+                        g_loss.item(),
+                        d_loss.item(),
+                        epoch + 1,
+                        batch_idx
+                    )
+
+                    # Optional: Add automatic adjustments if training isn't healthy
+                    if not training_healthy:
+                        for param_group in self.g_optimizer.param_groups:
+                            param_group['lr'] *= 0.95
+                        for param_group in self.d_optimizer.param_groups:
+                            param_group['lr'] *= 1.05
+
                     # Update progress bar
                     status = {
                         'D_loss': f"{d_loss.item():.4f}",
-                        'G_loss': f"{g_loss.item():.4f}"
+                        'G_loss': f"{g_loss.item():.4f}",
+                        'Healthy': training_healthy
                     }
 
                     if self.use_cuda:
