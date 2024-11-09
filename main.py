@@ -7,6 +7,7 @@ from PIL import Image
 import os
 from pathlib import Path
 import numpy as np
+from torchvision.utils import save_image, make_grid
 from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
@@ -131,6 +132,10 @@ class AnimeDataset(Dataset):
                     logger.error(f"Failed to load image after {max_retries} attempts: {img_path}")
                     # Return a random valid index instead
                     return self.__getitem__(np.random.randint(self.__len__()))
+
+    def __len__(self):
+        """Return the total number of images in the dataset"""
+        return len(self.image_paths)
 
 class TrainingMonitor:
     def __init__(self, save_dir="training_progress"):
@@ -260,26 +265,94 @@ class Discriminator(nn.Module):
         combined = torch.cat([features, label_embedding], dim=1)
         return self.output(combined)
 
+
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Check CUDA availability properly
+        self.use_cuda = torch.cuda.is_available()
+        if self.use_cuda:
+            torch.backends.cudnn.benchmark = True
+            self.device = torch.device("cuda:0")
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            self.device = torch.device("cpu")
+            logger.warning("CUDA is not available. Running on CPU!")
+
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
 
-        # Initialize dataset with network path
+        # Initialize dataset
         logger.info(f"Initializing dataset from network path: {network_path}")
         self.dataset = AnimeDataset(network_path, image_size)
 
-        # Create data loader with appropriate num_workers
+        # Configure DataLoader based on device
+        num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0 if os.name == 'nt' else 4,  # Windows compatibility
-            pin_memory=True
-            )
+            num_workers=num_workers,
+            pin_memory=self.use_cuda,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+
+        # Initialize networks
+        self.generator = Generator(latent_dim, len(self.dataset.label_to_idx))
+        self.discriminator = Discriminator(len(self.dataset.label_to_idx))
+
+        # Move models to appropriate device
+        self.generator = self.generator.to(self.device)
+        self.discriminator = self.discriminator.to(self.device)
+
+        # Use half precision only if CUDA is available
+        self.use_half = self.use_cuda
+        if self.use_half:
+            self.generator = self.generator.half()
+            self.discriminator = self.discriminator.half()
+            logger.info("Using FP16 (half precision) for models")
+
+        # Initialize optimizers
+        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
+        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.real_label_val = 0.9
+        self.fake_label_val = 0.0
+        self.monitor = TrainingMonitor()
+
+        # Log GPU memory usage after initialization
+        if torch.cuda.is_available():
+            logger.info(f"GPU Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+            logger.info(f"GPU Memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+
+    def generate_samples(self, num_samples, labels):
+        self.generator.eval()
+        with torch.no_grad():
+            noise = torch.randn(num_samples, self.latent_dim, device=self.device,
+                                dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
+            fake_images = self.generator(noise, labels)
+            if torch.cuda.is_available():
+                fake_images = fake_images.float()  # Convert back to float32 for display
+        self.generator.train()
+        return fake_images
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load a checkpoint"""
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.generator.load_state_dict(checkpoint['generator_state_dict'])
+            self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+            self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
+            self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
+            return checkpoint['epoch']
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise
 
     def save_checkpoint(self, epoch: int, path: str = "checkpoints", is_best: bool = False):
         try:
@@ -307,90 +380,119 @@ class AnimeGeneratorTrainer:
             logger.error(f"Failed to save checkpoint: {e}")
 
     def train(self, num_epochs=100, save_interval=5):
-        best_fid = float('inf')  # Track best model performance
+        # Initialize scaler only if CUDA is available
+        scaler = torch.cuda.amp.GradScaler() if self.use_cuda else None
+
+        def noisy_labels(size, value):
+            dtype = torch.float16 if self.use_half else torch.float32
+            return (torch.ones(size, 1, device=self.device, dtype=dtype) * value +
+                    torch.randn(size, 1, device=self.device, dtype=dtype) * 0.05)
 
         for epoch in range(num_epochs):
             running_d_loss = 0.0
             running_g_loss = 0.0
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-            for real_images, labels in pbar:
+            for batch_idx, (real_images, labels) in enumerate(pbar):
                 batch_size = real_images.size(0)
+
+                # Move data to device and convert to half if using CUDA
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
+                if self.use_half:
+                    real_images = real_images.half()
 
-                # ======= Train Discriminator =======
+                # Train Discriminator
                 self.d_optimizer.zero_grad()
 
-                # Real images
-                label_real = torch.ones(batch_size, 1).to(self.device)
-                label_fake = torch.zeros(batch_size, 1).to(self.device)
+                # Use context manager only if CUDA is available
+                context = torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu',
+                                             dtype=torch.float16 if self.use_half else torch.float32)
 
-                output_real = self.discriminator(real_images, labels)
-                d_loss_real = self.criterion(output_real, label_real)
+                with context:
+                    # Real images
+                    label_real = noisy_labels(batch_size, self.real_label_val)
+                    output_real = self.discriminator(real_images, labels)
+                    d_loss_real = self.criterion(output_real, label_real)
 
-                # Fake images
-                noise = torch.randn(batch_size, self.latent_dim).to(self.device)
-                fake_images = self.generator(noise, labels)
-                output_fake = self.discriminator(fake_images.detach(), labels)
-                d_loss_fake = self.criterion(output_fake, label_fake)
+                    # Fake images
+                    noise = torch.randn(batch_size, self.latent_dim, device=self.device,
+                                        dtype=torch.float16 if self.use_half else torch.float32)
+                    fake_images = self.generator(noise, labels)
+                    label_fake = noisy_labels(batch_size, self.fake_label_val)
+                    output_fake = self.discriminator(fake_images.detach(), labels)
+                    d_loss_fake = self.criterion(output_fake, label_fake)
 
-                # Total discriminator loss
-                d_loss = d_loss_real + d_loss_fake
-                d_loss.backward()
-                self.d_optimizer.step()
+                    d_loss = (d_loss_real + d_loss_fake) * 0.5
 
-                # ======= Train Generator =======
-                self.g_optimizer.zero_grad()
+                if self.use_cuda:
+                    scaler.scale(d_loss).backward()
+                    scaler.step(self.d_optimizer)
+                else:
+                    d_loss.backward()
+                    self.d_optimizer.step()
 
-                # Try to fool the discriminator
-                output_fake = self.discriminator(fake_images, labels)
-                g_loss = self.criterion(output_fake, label_real)
+                # Train Generator
+                if batch_idx % 2 == 0:
+                    self.g_optimizer.zero_grad()
 
-                g_loss.backward()
-                self.g_optimizer.step()
+                    with context:
+                        noise = torch.randn(batch_size, self.latent_dim, device=self.device,
+                                            dtype=torch.float16 if self.use_half else torch.float32)
+                        fake_images = self.generator(noise, labels)
+                        output_fake = self.discriminator(fake_images, labels)
+                        g_loss = self.criterion(output_fake, label_real)
+
+                    if self.use_cuda:
+                        scaler.scale(g_loss).backward()
+                        scaler.step(self.g_optimizer)
+                    else:
+                        g_loss.backward()
+                        self.g_optimizer.step()
+                else:
+                    g_loss = torch.tensor(0.0, device=self.device)
+
+                if self.use_cuda:
+                    scaler.update()
 
                 # Update running losses
                 running_d_loss += d_loss.item()
                 running_g_loss += g_loss.item()
 
-                # Update monitor
-                self.monitor.update(g_loss.item(), d_loss.item())
+                if batch_idx % 10 == 0:
+                    self.monitor.update(g_loss.item(), d_loss.item())
 
-                # Check training quality
-                issues = self.monitor.check_training_quality(g_loss.item(), d_loss.item())
-                if issues:
-                    for issue in issues:
-                        logger.warning(f"Training issue detected: {issue}")
+                    # Update progress bar
+                    status = {
+                        'D_loss': f"{d_loss.item():.4f}",
+                        'G_loss': f"{g_loss.item():.4f}"
+                    }
 
-                pbar.set_postfix({
-                    'D_loss': f"{d_loss.item():.4f}",
-                    'G_loss': f"{g_loss.item():.4f}"
-                })
+                    if self.use_cuda:
+                        torch.cuda.empty_cache()
+                        status['GPU_mem'] = f"{torch.cuda.memory_allocated() / 1e9:.2f}GB"
 
-            # Generate and save sample images
+                    pbar.set_postfix(status)
+
+            # Save progress
             if (epoch + 1) % save_interval == 0:
+                self.save_checkpoint(epoch + 1)
                 with torch.no_grad():
-                    # Generate samples for different characters
                     num_samples = min(4, len(self.dataset.label_to_idx))
-                    sample_labels = torch.arange(num_samples).to(self.device)
+                    sample_labels = torch.arange(num_samples, device=self.device)
                     fake_images = self.generate_samples(num_samples, sample_labels)
+                    if self.use_half:
+                        fake_images = fake_images.float()
                     self.monitor.save_samples(fake_images, epoch + 1)
-
-                    # Plot and save loss curves
                     self.monitor.plot_losses(epoch + 1)
-
-                    # Save checkpoint
-                    self.save_checkpoint(epoch + 1)
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
-
 def main():
     # Configuration
-    network_path = r"\\192.168.1.66\plex\anime"
+    network_path = r"\\192.168.1.66\plex\hentai\processed_images"
     local_cache_dir = "local_cache"  # Optional local cache directory
     batch_size = 32
     num_epochs = 100
