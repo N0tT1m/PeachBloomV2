@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
+import torch.nn.functional as F
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -578,6 +579,8 @@ class Discriminator(nn.Module):
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
+        self.background_processor = BackgroundProcessor()
+
         # Check CUDA availability properly
         self.use_cuda = torch.cuda.is_available()
         if self.use_cuda:
@@ -710,11 +713,7 @@ class AnimeGeneratorTrainer:
 
     def train(self, num_epochs=100, save_interval=5):
         # Initialize scaler for mixed precision training
-        scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
-
-        def noisy_labels(size, value):
-            return (torch.ones(size, 1, device=self.device) * value +
-                    torch.randn(size, 1, device=self.device) * 0.05)
+        scaler = torch.amp.GradScaler() if self.use_cuda else None
 
         for epoch in range(num_epochs):
             running_d_loss = 0.0
@@ -722,69 +721,24 @@ class AnimeGeneratorTrainer:
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, (real_images, labels) in enumerate(pbar):
-                batch_size = real_images.size(0)
-
                 # Move data to device
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
 
-                # Train Discriminator
-                self.d_optimizer.zero_grad()
-
-                with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
-                    # Real images
-                    label_real = noisy_labels(batch_size, self.real_label_val)
-                    output_real = self.discriminator(real_images, labels)
-                    d_loss_real = self.criterion(output_real, label_real)
-
-                    # Fake images
-                    noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-                    fake_images = self.generator(noise, labels)
-                    label_fake = noisy_labels(batch_size, self.fake_label_val)
-                    output_fake = self.discriminator(fake_images.detach(), labels)
-                    d_loss_fake = self.criterion(output_fake, label_fake)
-
-                    d_loss = (d_loss_real + d_loss_fake) * 0.5
-
-                if self.use_cuda:
-                    scaler.scale(d_loss).backward()
-                    scaler.step(self.d_optimizer)
-                    scaler.update()
-                else:
-                    d_loss.backward()
-                    self.d_optimizer.step()
-
-                # Train Generator
-                if batch_idx % 2 == 0:
-                    self.g_optimizer.zero_grad()
-
-                    with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
-                        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-                        fake_images = self.generator(noise, labels)
-                        output_fake = self.discriminator(fake_images, labels)
-                        g_loss = self.criterion(output_fake, label_real)
-
-                    if self.use_cuda:
-                        scaler.scale(g_loss).backward()
-                        scaler.step(self.g_optimizer)
-                        scaler.update()
-                    else:
-                        g_loss.backward()
-                        self.g_optimizer.step()
-                else:
-                    g_loss = torch.tensor(0.0, device=self.device)
+                # Use the train_step method instead of separate G and D training
+                d_loss, g_loss = self.train_step(real_images, labels)
 
                 # Update running losses
-                running_d_loss += d_loss.item()
-                running_g_loss += g_loss.item()
+                running_d_loss += d_loss
+                running_g_loss += g_loss
 
                 if batch_idx % 10 == 0:
-                    self.monitor.update(g_loss.item(), d_loss.item())
+                    self.monitor.update(g_loss, d_loss)
 
-                    # Add health monitoring here
+                    # Add health monitoring
                     training_healthy = self.monitor_training_health(
-                        g_loss.item(),
-                        d_loss.item(),
+                        g_loss,
+                        d_loss,
                         epoch + 1,
                         batch_idx
                     )
@@ -798,8 +752,8 @@ class AnimeGeneratorTrainer:
 
                     # Update progress bar
                     status = {
-                        'D_loss': f"{d_loss.item():.4f}",
-                        'G_loss': f"{g_loss.item():.4f}",
+                        'D_loss': f"{d_loss:.4f}",
+                        'G_loss': f"{g_loss:.4f}",
                         'Healthy': training_healthy
                     }
 
@@ -809,19 +763,33 @@ class AnimeGeneratorTrainer:
 
                     pbar.set_postfix(status)
 
-            # Save progress
+                # Save progress
+                if (batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1):
+                    with torch.no_grad():
+                        # Generate samples with different backgrounds
+                        num_samples = min(4, len(self.dataset.label_to_idx))
+                        sample_labels = torch.arange(num_samples, device=self.device)
+
+                        for bg_type in ['smooth', 'gradient', 'pattern']:
+                            generated_images = self.generate_samples(
+                                num_samples,
+                                sample_labels,
+                                background_type=bg_type
+                            )
+                            self.monitor.save_samples(
+                                generated_images,
+                                epoch + 1,
+                                prefix=f'progress_{bg_type}_bg'
+                            )
+
+            # Save checkpoint at interval
             if (epoch + 1) % save_interval == 0:
                 self.save_checkpoint(epoch + 1)
-                with torch.no_grad():
-                    num_samples = min(4, len(self.dataset.label_to_idx))
-                    sample_labels = torch.arange(num_samples, device=self.device)
-                    fake_images = self.generate_samples(num_samples, sample_labels)
-                    self.monitor.save_samples(fake_images, epoch + 1)
-                    self.monitor.plot_losses(epoch + 1)
+                self.monitor.plot_losses(epoch + 1)
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {self.monitor.check_training_quality(self, g_loss, d_loss)}")
+            logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
     def train_step(self, real_images, labels):
@@ -888,8 +856,16 @@ def main():
 
     # Generate with different background types
     for bg_type in ['smooth', 'gradient', 'pattern']:
-        generated_images = trainer.generate_samples(num_samples, sample_labels, background_type=bg_type)
-        trainer.monitor.save_samples(generated_images, num_epochs, prefix=f'final_{bg_type}_bg')
+        generated_images = trainer.generate_samples(
+            num_samples,
+            sample_labels,
+            background_type=bg_type
+        )
+        trainer.monitor.save_samples(
+            generated_images,
+            num_epochs,
+            prefix=f'final_{bg_type}_bg'
+        )
 
     logger.info(f"Final samples saved to {trainer.monitor.save_dir}")
 
