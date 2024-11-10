@@ -21,7 +21,7 @@ from rembg import remove
 import numpy as np
 from PIL import Image
 import torch
-import torchvision.transforms.functional as F
+import torchvision.transforms.functional as TF
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
