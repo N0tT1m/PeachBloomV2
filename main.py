@@ -58,30 +58,45 @@ class BackgroundProcessor:
         return kernel.unsqueeze(0).unsqueeze(0)
 
     def get_background_mask(self, tensor):
+        # Ensure input tensor has correct dimensions
+        B, C, H, W = tensor.size()
+
+        # Convert to grayscale
         gray = 0.299 * tensor[:, 0] + 0.587 * tensor[:, 1] + 0.114 * tensor[:, 2]
 
-        dx = gray[:, :, 1:] - gray[:, :, :-1]
-        dy = gray[:, 1:, :] - gray[:, :-1, :]
+        # Calculate gradients
+        dx = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 1, 0, 0), mode='replicate')
+        dy = F.pad(gray[:, 1:, :] - gray[:, :-1, :], (0, 0, 0, 1), mode='replicate')
 
-        gradient_mag = torch.sqrt(
-            F.pad(dx[:, :-1, :] ** 2 + dy[:, :, :-1] ** 2, (1, 1, 1, 1), mode='replicate')
-        )
+        # Calculate gradient magnitude
+        gradient_mag = torch.sqrt(dx ** 2 + dy ** 2)
 
+        # Create mask
         mask = (gradient_mag < self.threshold).float()
-        mask = self.apply_gaussian_smoothing(mask.unsqueeze(1)).squeeze(1)
 
-        return mask.unsqueeze(1).expand(-1, 3, -1, -1)
+        # Apply smoothing
+        mask = self.apply_gaussian_smoothing(mask.unsqueeze(1))
+
+        # Ensure mask has same size as input
+        mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
+
+        return mask.expand(-1, 3, -1, -1)
 
     def process_image(self, tensor, background_type='smooth'):
+        B, C, H, W = tensor.size()
         bg_mask = self.get_background_mask(tensor)
 
         if background_type == 'smooth':
-            bg = self.create_smooth_background(tensor)
+            bg = torch.ones_like(tensor) * 0.5
         elif background_type == 'gradient':
-            bg = self.create_gradient_background(tensor)
+            gradient = torch.linspace(0, 1, W, device=tensor.device)
+            gradient = gradient.view(1, 1, 1, -1).expand(B, C, H, W)
+            bg = gradient
         else:  # pattern
-            bg = self.create_pattern_background(tensor)
+            bg = torch.zeros_like(tensor)
+            bg[:, :, ::4, ::4] = 1
 
+        # Ensure all tensors have the same size
         processed = (1 - bg_mask) * tensor + bg_mask * bg
         processed = self.apply_gaussian_smoothing(processed)
 
