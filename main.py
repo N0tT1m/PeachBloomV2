@@ -28,6 +28,79 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class BackgroundProcessor:
+    def __init__(self, threshold=0.5, blur_kernel_size=5, smooth_factor=0.8):
+        self.threshold = threshold
+        self.blur_kernel_size = blur_kernel_size
+        self.smooth_factor = smooth_factor
+
+    def apply_gaussian_smoothing(self, tensor):
+        padding = (self.blur_kernel_size - 1) // 2
+        gaussian_kernel = self._create_gaussian_kernel(self.blur_kernel_size)
+        gaussian_kernel = gaussian_kernel.expand(tensor.size(1), 1, self.blur_kernel_size, self.blur_kernel_size)
+
+        return F.conv2d(
+            tensor,
+            gaussian_kernel.to(tensor.device),
+            padding=padding,
+            groups=tensor.size(1)
+        )
+
+    def _create_gaussian_kernel(self, kernel_size, sigma=1.5):
+        x = torch.linspace(-sigma, sigma, kernel_size)
+        x = x.expand(kernel_size, -1)
+        y = x.t()
+
+        kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+        kernel = kernel / kernel.sum()
+
+        return kernel.unsqueeze(0).unsqueeze(0)
+
+    def get_background_mask(self, tensor):
+        gray = 0.299 * tensor[:, 0] + 0.587 * tensor[:, 1] + 0.114 * tensor[:, 2]
+
+        dx = gray[:, :, 1:] - gray[:, :, :-1]
+        dy = gray[:, 1:, :] - gray[:, :-1, :]
+
+        gradient_mag = torch.sqrt(
+            F.pad(dx[:, :-1, :] ** 2 + dy[:, :, :-1] ** 2, (1, 1, 1, 1), mode='replicate')
+        )
+
+        mask = (gradient_mag < self.threshold).float()
+        mask = self.apply_gaussian_smoothing(mask.unsqueeze(1)).squeeze(1)
+
+        return mask.unsqueeze(1).expand(-1, 3, -1, -1)
+
+    def process_image(self, tensor, background_type='smooth'):
+        bg_mask = self.get_background_mask(tensor)
+
+        if background_type == 'smooth':
+            bg = self.create_smooth_background(tensor)
+        elif background_type == 'gradient':
+            bg = self.create_gradient_background(tensor)
+        else:  # pattern
+            bg = self.create_pattern_background(tensor)
+
+        processed = (1 - bg_mask) * tensor + bg_mask * bg
+        processed = self.apply_gaussian_smoothing(processed)
+
+        return processed
+
+    def create_smooth_background(self, tensor):
+        return torch.ones_like(tensor) * 0.5
+
+    def create_gradient_background(self, tensor):
+        h, w = tensor.shape[2:]
+        gradient = torch.linspace(0, 1, w, device=tensor.device)
+        gradient = gradient.view(1, 1, 1, -1).expand(tensor.shape[0], 3, h, w)
+        return gradient
+
+    def create_pattern_background(self, tensor):
+        h, w = tensor.shape[2:]
+        pattern = torch.zeros_like(tensor)
+        pattern[:, :, ::4, ::4] = 1
+        return pattern
+
 class NetworkPathHandler:
     def __init__(self, network_path: str, max_retries: int = 3, retry_delay: int = 5):
         self.network_path = Path(network_path)
@@ -35,14 +108,12 @@ class NetworkPathHandler:
         self.retry_delay = retry_delay
 
     def check_path_accessible(self) -> bool:
-        """Check if network path is accessible"""
         try:
             return self.network_path.exists()
         except (PermissionError, OSError):
             return False
 
     def wait_for_access(self) -> bool:
-        """Wait for network path to become accessible"""
         for attempt in range(self.max_retries):
             if self.check_path_accessible():
                 return True
@@ -61,7 +132,6 @@ class AnimeDataset(Dataset):
         self.image_size = image_size
         self.remove_bg = remove_bg
 
-        # Modified transform pipeline
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -73,7 +143,6 @@ class AnimeDataset(Dataset):
         self.label_to_idx = {}
         self.idx_to_label = {}
 
-        # Create cache directory for processed images
         self.cache_dir = Path("processed_cache")
         self.cache_dir.mkdir(exist_ok=True)
 
@@ -327,40 +396,33 @@ class Generator(nn.Module):
         self.latent_dim = latent_dim
         self.num_classes = num_classes
 
-        # Improved label embedding with higher dimensionality
-        self.label_embedding = nn.Embedding(num_classes, 100)  # Increased from 50 to 100
+        self.label_embedding = nn.Embedding(num_classes, 100)
 
-        # Initial dense layer with improved capacity
         self.initial = nn.Sequential(
-            nn.Linear(latent_dim + 100, 512 * 8 * 8),  # Increased from 256 to 512
+            nn.Linear(latent_dim + 100, 512 * 8 * 8),
             nn.LeakyReLU(0.2),
             nn.BatchNorm1d(512 * 8 * 8),
-            nn.Dropout(0.3)  # Add dropout for regularization
+            nn.Dropout(0.3)
         )
 
-        # Main convolutional layers
         self.conv_blocks = nn.ModuleList([
-            # 8x8 -> 16x16
             nn.Sequential(
                 nn.ConvTranspose2d(512, 256, 4, 2, 1),
                 nn.BatchNorm2d(256),
                 nn.LeakyReLU(0.2),
                 nn.Dropout2d(0.3)
             ),
-            # 16x16 -> 32x32
             nn.Sequential(
                 nn.ConvTranspose2d(256, 128, 4, 2, 1),
                 nn.BatchNorm2d(128),
                 nn.LeakyReLU(0.2),
                 nn.Dropout2d(0.3)
             ),
-            # 32x32 -> 64x64
             nn.Sequential(
                 nn.ConvTranspose2d(128, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.LeakyReLU(0.2)
             ),
-            # 64x64 -> 128x128
             nn.Sequential(
                 nn.ConvTranspose2d(64, 32, 4, 2, 1),
                 nn.BatchNorm2d(32),
@@ -368,16 +430,13 @@ class Generator(nn.Module):
             )
         ])
 
-        # Self-attention layer after second conv block
         self.attention = SelfAttention(128)
 
-        # Final layer
         self.final = nn.Sequential(
             nn.ConvTranspose2d(32, 3, 3, 1, 1),
             nn.Tanh()
         )
 
-        # Initialize weights for better training
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -520,26 +579,15 @@ class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
 
-        # Check CUDA availability properly
         self.use_cuda = torch.cuda.is_available()
-        if self.use_cuda:
-            torch.backends.cudnn.benchmark = True
-            self.device = torch.device("cuda:0")
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-            logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        else:
-            self.device = torch.device("cpu")
-            logger.warning("CUDA is not available. Running on CPU!")
-
+        self.device = torch.device("cuda:0" if self.use_cuda else "cpu")
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
+        self.background_processor = BackgroundProcessor()
 
-        # Initialize dataset
-        logger.info(f"Initializing dataset from network path: {network_path}")
+        # Initialize dataset and dataloader
         self.dataset = AnimeDataset(network_path, image_size)
-
-        # Configure DataLoader
         num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
             self.dataset,
@@ -555,11 +603,11 @@ class AnimeGeneratorTrainer:
         self.generator = Generator(latent_dim, len(self.dataset.label_to_idx))
         self.discriminator = Discriminator(len(self.dataset.label_to_idx))
 
-        # Move models to appropriate device
+        # Move models to device
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
 
-        # Initialize optimizers
+        # Initialize optimizers with improved parameters
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
 
@@ -601,16 +649,18 @@ class AnimeGeneratorTrainer:
 
         return len(warnings) == 0  # Return True if training looks healthy
 
-    def generate_samples(self, num_samples, labels):
+    def generate_samples(self, num_samples, labels, background_type='smooth'):
+        """Generate samples with background processing"""
         self.generator.eval()
         with torch.no_grad():
-            noise = torch.randn(num_samples, self.latent_dim, device=self.device,
-                                dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
+            noise = torch.randn(num_samples, self.latent_dim, device=self.device)
             fake_images = self.generator(noise, labels)
-            if torch.cuda.is_available():
-                fake_images = fake_images.float()  # Convert back to float32 for display
+            processed_images = self.background_processor.process_image(
+                fake_images,
+                background_type=background_type
+            )
         self.generator.train()
-        return fake_images
+        return processed_images
 
     def load_checkpoint(self, checkpoint_path):
         """Load a checkpoint"""
@@ -766,18 +816,51 @@ class AnimeGeneratorTrainer:
             logger.info(f"Issues: {self.monitor.check_training_quality(self, g_loss, d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
+    def train_step(self, real_images, labels):
+        """Modified training step with background processing"""
+        batch_size = real_images.size(0)
+
+        # Train discriminator
+        self.d_optimizer.zero_grad()
+
+        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
+        fake_images = self.generator(noise, labels)
+        processed_fake = self.background_processor.process_image(fake_images)
+
+        d_loss_real = self.criterion(
+            self.discriminator(real_images, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        d_loss_fake = self.criterion(
+            self.discriminator(processed_fake.detach(), labels),
+            torch.zeros(batch_size, 1, device=self.device)
+        )
+
+        d_loss = (d_loss_real + d_loss_fake) * 0.5
+        d_loss.backward()
+        self.d_optimizer.step()
+
+        # Train generator
+        self.g_optimizer.zero_grad()
+        g_loss = self.criterion(
+            self.discriminator(processed_fake, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        g_loss.backward()
+        self.g_optimizer.step()
+
+        return d_loss.item(), g_loss.item()
 
 def main():
     # Configuration
     network_path = r"\\192.168.1.66\plex\hentai\processed_images"
-    local_cache_dir = "local_cache"  # Optional local cache directory
+    local_cache_dir = "local_cache"
     batch_size = 32
     num_epochs = 100
     save_interval = 5
     image_size = 128
     latent_dim = 100
 
-    # Initialize and train
     trainer = AnimeGeneratorTrainer(
         network_path=network_path,
         batch_size=batch_size,
@@ -786,22 +869,21 @@ def main():
         local_cache_dir=local_cache_dir
     )
 
-    # Start training
     trainer.train(num_epochs=num_epochs, save_interval=save_interval)
 
-    # After training, generate samples
-    logger.info("Training completed. Generating sample images...")
+    # Generate samples with different backgrounds
+    logger.info("Generating sample images with different backgrounds...")
     trainer.load_checkpoint("checkpoints/best_model.pt")
 
-    # Generate samples for different characters
     num_samples = min(16, len(trainer.dataset.label_to_idx))
     sample_labels = torch.arange(num_samples).to(trainer.device)
-    generated_images = trainer.generate_samples(num_samples, sample_labels)
 
-    # Save final samples
-    trainer.monitor.save_samples(generated_images, epoch=num_epochs, prefix='final')
+    # Generate with different background types
+    for bg_type in ['smooth', 'gradient', 'pattern']:
+        generated_images = trainer.generate_samples(num_samples, sample_labels, background_type=bg_type)
+        trainer.monitor.save_samples(generated_images, num_epochs, prefix=f'final_{bg_type}_bg')
+
     logger.info(f"Final samples saved to {trainer.monitor.save_dir}")
-
 
 if __name__ == "__main__":
     main()
