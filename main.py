@@ -719,7 +719,7 @@ class AnimeGeneratorTrainer:
         # Initialize scaler for mixed precision training
         scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
 
-        monitor = EnhancedTrainingMonitor()
+        enhanced_monitor = EnhancedTrainingMonitor()
 
         def noisy_labels(size, value):
             return (torch.ones(size, 1, device=self.device) * value +
@@ -795,7 +795,7 @@ class AnimeGeneratorTrainer:
                         batch_idx
                     )
 
-                    await monitor.update(
+                    await enhanced_monitor.update(
                         g_loss.item(),
                         d_loss.item(),
                         batch_idx,
@@ -847,28 +847,28 @@ class AnimeGeneratorTrainer:
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {monitor.check_training_quality(self, g_loss, d_loss)}")
+            logger.info(f"Issues: {monitor.check_training_quality(g_loss, d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
-monitor = EnhancedTrainingMonitor()
+enhanced_monitor = EnhancedTrainingMonitor()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    monitor.connected_clients.add(websocket)
+    enhanced_monitor.connected_clients.add(websocket)
     try:
         while True:
             await asyncio.sleep(1)  # Keep connection alive
     except:
-        monitor.connected_clients.remove(websocket)
+        enhanced_monitor.connected_clients.remove(websocket)
 
 @app.get("/stats")
 async def get_stats():
-    return monitor.training_stats
+    return enhanced_monitor.training_stats
 
 @app.get("/images/{epoch}")
 async def get_images(epoch: int):
-    image_path = monitor.save_dir / f'generated_samples_epoch_{epoch}.png'
+    image_path = enhanced_monitor.save_dir / f'generated_samples_epoch_{epoch}.png'
     if image_path.exists():
         return FileResponse(image_path)
     return {"error": "Image not found"}
