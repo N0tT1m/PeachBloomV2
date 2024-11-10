@@ -578,9 +578,17 @@ class Discriminator(nn.Module):
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
-
+        # Check CUDA availability properly
         self.use_cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda:0" if self.use_cuda else "cpu")
+        if self.use_cuda:
+            torch.backends.cudnn.benchmark = True
+            self.device = torch.device("cuda:0")
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            self.device = torch.device("cpu")
+            logger.warning("CUDA is not available. Running on CPU!")
+
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
