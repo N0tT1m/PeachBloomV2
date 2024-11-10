@@ -1,7 +1,3 @@
-import asyncio
-import json
-from datetime import datetime
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,79 +18,15 @@ from pathlib import WindowsPath
 import time
 from typing import Optional
 from rembg import remove
+import numpy as np
 from PIL import Image
 import torch
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import FileResponse
-from pathlib import Path
-import psutil
-import GPUtil
 import torchvision.transforms.functional as F
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-
-class EnhancedTrainingMonitor:
-    def __init__(self, save_dir="training_progress"):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(exist_ok=True)
-        self.training_stats = {
-            'g_losses': [],
-            'd_losses': [],
-            'epochs_completed': 0,
-            'current_batch': 0,
-            'total_batches': 0,
-            'training_healthy': True,
-            'warnings': [],
-            'gpu_stats': {},
-            'start_time': datetime.now().isoformat(),
-            'last_update': None
-        }
-        self.connected_clients = set()
-
-    async def broadcast_stats(self):
-        """Broadcast stats to all connected websocket clients"""
-        if self.connected_clients:
-            # Add system metrics
-            self.training_stats['system_metrics'] = {
-                'cpu_percent': psutil.cpu_percent(),
-                'memory_percent': psutil.virtual_memory().percent,
-                'gpu_stats': self._get_gpu_stats() if GPUtil.getGPUs() else {}
-            }
-
-            message = json.dumps(self.training_stats)
-            await asyncio.gather(
-                *[client.send_text(message) for client in self.connected_clients]
-            )
-
-    def _get_gpu_stats(self):
-        """Get GPU statistics if available"""
-        try:
-            gpus = GPUtil.getGPUs()
-            return {
-                'gpu_load': gpus[0].load * 100,
-                'gpu_memory_used': gpus[0].memoryUsed,
-                'gpu_memory_total': gpus[0].memoryTotal
-            }
-        except:
-            return {}
-
-    def update(self, g_loss, d_loss, batch_idx, total_batches, epoch, training_healthy=True, warnings=None):
-        """Update training statistics"""
-        self.training_stats.update({
-            'g_losses': self.training_stats['g_losses'][-1000:] + [float(g_loss)],
-            'd_losses': self.training_stats['d_losses'][-1000:] + [float(d_loss)],
-            'current_batch': batch_idx,
-            'total_batches': total_batches,
-            'epochs_completed': epoch,
-            'training_healthy': training_healthy,
-            'warnings': warnings or [],
-            'last_update': datetime.now().isoformat()
-        })
 
 class NetworkPathHandler:
     def __init__(self, network_path: str, max_retries: int = 3, retry_delay: int = 5):
@@ -117,6 +49,7 @@ class NetworkPathHandler:
             logger.warning(f"Network path not accessible, attempt {attempt + 1}/{self.max_retries}")
             time.sleep(self.retry_delay)
         return False
+
 
 class AnimeDataset(Dataset):
     def __init__(self, network_path: str, image_size: int = 256, remove_bg: bool = True):
@@ -328,6 +261,7 @@ class AnimeDataset(Dataset):
 
     def __len__(self):
         return len(self.image_paths)
+
 
 class TrainingMonitor:
     def __init__(self, save_dir="training_progress"):
@@ -544,6 +478,7 @@ def improved_training_setup(self):
     self.real_label_val = 0.9  # Instead of 1.0
     self.fake_label_val = 0.1  # Instead of 0.0
 
+
 # Discriminator Network
 class Discriminator(nn.Module):
     def __init__(self, num_classes):
@@ -715,11 +650,9 @@ class AnimeGeneratorTrainer:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    async def train(self, num_epochs=100, save_interval=5):
+    def train(self, num_epochs=100, save_interval=5):
         # Initialize scaler for mixed precision training
         scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
-
-        enhanced_monitor = EnhancedTrainingMonitor()
 
         def noisy_labels(size, value):
             return (torch.ones(size, 1, device=self.device) * value +
@@ -788,23 +721,6 @@ class AnimeGeneratorTrainer:
                 running_g_loss += g_loss.item()
 
                 if batch_idx % 10 == 0:
-                    training_healthy = self.monitor_training_health(
-                        g_loss.item(),
-                        d_loss.item(),
-                        epoch + 1,
-                        batch_idx
-                    )
-
-                    await enhanced_monitor.update(
-                        g_loss.item(),
-                        d_loss.item(),
-                        batch_idx,
-                        len(self.dataloader),
-                        epoch,
-                        training_healthy,
-                        self.monitor.check_training_quality(g_loss.item(), d_loss.item())
-                    )
-
                     self.monitor.update(g_loss.item(), d_loss.item())
 
                     # Add health monitoring here
@@ -847,31 +763,9 @@ class AnimeGeneratorTrainer:
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {monitor.check_training_quality(g_loss, d_loss)}")
+            logger.info(f"Issues: {self.monitor.check_training_quality(self, g_loss, d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
-enhanced_monitor = EnhancedTrainingMonitor()
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    enhanced_monitor.connected_clients.add(websocket)
-    try:
-        while True:
-            await asyncio.sleep(1)  # Keep connection alive
-    except:
-        enhanced_monitor.connected_clients.remove(websocket)
-
-@app.get("/stats")
-async def get_stats():
-    return enhanced_monitor.training_stats
-
-@app.get("/images/{epoch}")
-async def get_images(epoch: int):
-    image_path = enhanced_monitor.save_dir / f'generated_samples_epoch_{epoch}.png'
-    if image_path.exists():
-        return FileResponse(image_path)
-    return {"error": "Image not found"}
 
 def main():
     # Configuration
@@ -907,6 +801,7 @@ def main():
     # Save final samples
     trainer.monitor.save_samples(generated_images, epoch=num_epochs, prefix='final')
     logger.info(f"Final samples saved to {trainer.monitor.save_dir}")
+
 
 if __name__ == "__main__":
     main()
