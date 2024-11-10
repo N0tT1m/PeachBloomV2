@@ -15,6 +15,11 @@ import shutil
 from pathlib import WindowsPath
 import time
 from typing import Optional
+from rembg import remove
+import numpy as np
+from PIL import Image
+import torch
+import torchvision.transforms.functional as TF
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -43,45 +48,17 @@ class NetworkPathHandler:
             time.sleep(self.retry_delay)
         return False
 
-
-# [Previous imports remain the same...]
-import shutil
-from pathlib import WindowsPath
-import time
-from typing import Optional
-
-
-class NetworkPathHandler:
-    def __init__(self, network_path: str, max_retries: int = 3, retry_delay: int = 5):
-        self.network_path = Path(network_path)
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-
-    def check_path_accessible(self) -> bool:
-        """Check if network path is accessible"""
-        try:
-            return self.network_path.exists()
-        except (PermissionError, OSError):
-            return False
-
-    def wait_for_access(self) -> bool:
-        """Wait for network path to become accessible"""
-        for attempt in range(self.max_retries):
-            if self.check_path_accessible():
-                return True
-            logger.warning(f"Network path not accessible, attempt {attempt + 1}/{self.max_retries}")
-            time.sleep(self.retry_delay)
-        return False
-
-
 class AnimeDataset(Dataset):
-    def __init__(self, network_path: str, image_size: int = 256):
+    def __init__(self, network_path: str, image_size: int = 256, remove_bg: bool = True):
         self.network_handler = NetworkPathHandler(network_path)
         if not self.network_handler.wait_for_access():
             raise RuntimeError(f"Could not access network path: {network_path}")
 
         self.root_dir = Path(network_path)
         self.image_size = image_size
+        self.remove_bg = remove_bg
+
+        # Modified transform pipeline
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -93,9 +70,98 @@ class AnimeDataset(Dataset):
         self.label_to_idx = {}
         self.idx_to_label = {}
 
+        # Create cache directory for processed images
+        self.cache_dir = Path("processed_cache")
+        self.cache_dir.mkdir(exist_ok=True)
+
         logger.info("Scanning network directory for images...")
         self._scan_directories()
-        self._validate_images()  # New validation step
+        self._validate_and_process_images()
+
+    def _remove_background(self, img_path: Path) -> Image.Image:
+        """Remove background from image using rembg"""
+        try:
+            # Generate cache path
+            cache_path = self.cache_dir / f"{img_path.stem}_nobg.png"
+
+            # If cached version exists, load it
+            if cache_path.exists():
+                return Image.open(cache_path)
+
+            # Process image and cache result
+            with Image.open(img_path) as img:
+                # Convert to RGBA for transparency
+                img = img.convert('RGBA')
+                # Remove background
+                output = remove(img)
+                # Save to cache
+                output.save(cache_path)
+                return output
+
+        except Exception as e:
+            logger.warning(f"Failed to remove background from {img_path}: {e}")
+            # Return original image if background removal fails
+            return Image.open(img_path)
+
+    def _center_crop_character(self, img: Image.Image) -> Image.Image:
+        """Center crop the image around the non-transparent areas"""
+        if img.mode == 'RGBA':
+            # Get alpha channel
+            alpha = np.array(img.split()[-1])
+            # Find non-transparent pixels
+            non_transparent = np.where(alpha > 0)
+            if len(non_transparent[0]) > 0:
+                # Get bounding box
+                top, left = np.min(non_transparent[0]), np.min(non_transparent[1])
+                bottom, right = np.max(non_transparent[0]), np.max(non_transparent[1])
+
+                # Add padding
+                height, width = bottom - top, right - left
+                padding = max(height, width) // 4
+
+                top = max(0, top - padding)
+                bottom = min(img.height, bottom + padding)
+                left = max(0, left - padding)
+                right = min(img.width, right + padding)
+
+                # Crop image
+                return img.crop((left, top, right, bottom))
+        return img
+
+    def _validate_and_process_images(self):
+        """Validate and process all images"""
+        valid_paths = []
+        valid_labels = []
+
+        logger.info("Validating and processing images...")
+        for idx, (path, label) in enumerate(zip(self.image_paths, self.labels)):
+            try:
+                if self._is_valid_image(path):
+                    if self.remove_bg:
+                        # Remove background and center crop
+                        processed_img = self._remove_background(path)
+                        processed_img = self._center_crop_character(processed_img)
+
+                        # Convert back to RGB (removing alpha channel)
+                        if processed_img.mode == 'RGBA':
+                            # Create white background
+                            background = Image.new('RGBA', processed_img.size, (255, 255, 255, 255))
+                            background.paste(processed_img, mask=processed_img.split()[-1])
+                            processed_img = background.convert('RGB')
+
+                        valid_paths.append(path)
+                        valid_labels.append(label)
+
+                if idx % 100 == 0:
+                    logger.info(f"Processed {idx + 1}/{len(self.image_paths)} images")
+
+            except Exception as e:
+                logger.warning(f"Failed to process image {path}: {e}")
+                continue
+
+        self.image_paths = valid_paths
+        self.labels = valid_labels
+        logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
 
     def _is_valid_image(self, path: Path) -> bool:
         """Check if file is a valid image"""
@@ -159,29 +225,36 @@ class AnimeDataset(Dataset):
             try:
                 img_path = self.image_paths[idx]
 
-                # Open and validate image
-                with Image.open(img_path) as img:
-                    # Convert to RGB first
+                if self.remove_bg:
+                    # Load processed image from cache
+                    cache_path = self.cache_dir / f"{Path(img_path).stem}_nobg.png"
+                    if cache_path.exists():
+                        img = Image.open(cache_path)
+                    else:
+                        img = self._remove_background(img_path)
+                        img = self._center_crop_character(img)
+                else:
+                    img = Image.open(img_path)
+
+                # Convert to RGB
+                if img.mode == 'RGBA':
+                    background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                    background.paste(img, mask=img.split()[-1])
+                    img = background.convert('RGB')
+                else:
                     img = img.convert('RGB')
 
-                    # Apply transformations
-                    image = self.transform(img)
-
-                    label = self.labels[idx]
-                    return image, label
+                # Apply transformations
+                image = self.transform(img)
+                label = self.labels[idx]
+                return image, label
 
             except (OSError, PermissionError) as e:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to load image {img_path}: {str(e)}")
                 if attempt == max_retries - 1:
-                    logger.error(f"Failed to load image after {max_retries} attempts: {img_path}")
-                    # Return a different valid index instead
                     new_idx = (idx + 1) % len(self)
                     return self.__getitem__(new_idx)
-                time.sleep(1)  # Wait before retry
-            except Exception as e:
-                logger.error(f"Unexpected error loading image {img_path}: {str(e)}")
-                new_idx = (idx + 1) % len(self)
-                return self.__getitem__(new_idx)
+                time.sleep(1)
 
     def __len__(self):
         return len(self.image_paths)
@@ -242,41 +315,164 @@ class TrainingMonitor:
 
         return issues
 
-# Generator Network
+
+# Improved Generator Network with Self-Attention and Better Architecture
 class Generator(nn.Module):
     def __init__(self, latent_dim, num_classes):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
 
-        self.label_embedding = nn.Embedding(num_classes, 50)
+        # Improved label embedding with higher dimensionality
+        self.label_embedding = nn.Embedding(num_classes, 100)  # Increased from 50 to 100
 
-        self.model = nn.Sequential(
-            # Input: latent_dim + 50 (embedded label)
-            nn.Linear(latent_dim + 50, 256 * 8 * 8),
+        # Initial dense layer with improved capacity
+        self.initial = nn.Sequential(
+            nn.Linear(latent_dim + 100, 512 * 8 * 8),  # Increased from 256 to 512
             nn.LeakyReLU(0.2),
-            nn.Unflatten(1, (256, 8, 8)),
+            nn.BatchNorm1d(512 * 8 * 8),
+            nn.Dropout(0.3)  # Add dropout for regularization
+        )
 
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
+        # Main convolutional layers
+        self.conv_blocks = nn.ModuleList([
+            # 8x8 -> 16x16
+            nn.Sequential(
+                nn.ConvTranspose2d(512, 256, 4, 2, 1),
+                nn.BatchNorm2d(256),
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(0.3)
+            ),
+            # 16x16 -> 32x32
+            nn.Sequential(
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),
+                nn.BatchNorm2d(128),
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(0.3)
+            ),
+            # 32x32 -> 64x64
+            nn.Sequential(
+                nn.ConvTranspose2d(128, 64, 4, 2, 1),
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU(0.2)
+            ),
+            # 64x64 -> 128x128
+            nn.Sequential(
+                nn.ConvTranspose2d(64, 32, 4, 2, 1),
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(0.2)
+            )
+        ])
 
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
+        # Self-attention layer after second conv block
+        self.attention = SelfAttention(128)
 
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2),
-
-            nn.ConvTranspose2d(32, 3, 4, 2, 1),
+        # Final layer
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(32, 3, 3, 1, 1),
             nn.Tanh()
         )
 
+        # Initialize weights for better training
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
     def forward(self, z, labels):
+        # Improved label conditioning
         label_embedding = self.label_embedding(labels)
         x = torch.cat([z, label_embedding], dim=1)
-        return self.model(x)
+
+        # Initial dense layer
+        x = self.initial(x)
+        x = x.view(-1, 512, 8, 8)
+
+        # Process through conv blocks with attention
+        for idx, block in enumerate(self.conv_blocks):
+            x = block(x)
+            if idx == 1:  # Apply attention after second block
+                x = self.attention(x)
+
+        # Final convolution
+        x = self.final(x)
+        return x
+
+
+# Self-Attention Module
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.value = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, C, H, W = x.size()
+
+        # Reshape for attention
+        q = self.query(x).view(batch_size, -1, H * W).permute(0, 2, 1)
+        k = self.key(x).view(batch_size, -1, H * W)
+        v = self.value(x).view(batch_size, -1, H * W)
+
+        # Calculate attention
+        attention = torch.bmm(q, k)
+        attention = F.softmax(attention, dim=2)
+
+        # Apply attention to value
+        out = torch.bmm(v, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+
+        return x + self.gamma * out
+
+
+# Modified training parameters
+def get_improved_training_params():
+    return {
+        'g_lr': 0.0001,  # Reduced learning rate for stability
+        'd_lr': 0.0004,  # Higher discriminator learning rate
+        'beta1': 0.5,
+        'beta2': 0.999,
+        'latent_dim': 128,  # Increased from 100
+        'label_smoothing': 0.1,  # Add label smoothing
+        'noise_factor': 0.05  # For noisy labels
+    }
+
+
+# Training improvements to add to AnimeGeneratorTrainer.__init__
+def improved_training_setup(self):
+    params = get_improved_training_params()
+
+    # Use different learning rates for G and D
+    self.g_optimizer = optim.Adam(
+        self.generator.parameters(),
+        lr=params['g_lr'],
+        betas=(params['beta1'], params['beta2'])
+    )
+    self.d_optimizer = optim.Adam(
+        self.discriminator.parameters(),
+        lr=params['d_lr'],
+        betas=(params['beta1'], params['beta2'])
+    )
+
+    # Add learning rate schedulers
+    self.g_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        self.g_optimizer, mode='min', factor=0.5, patience=10, verbose=True
+    )
+    self.d_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        self.d_optimizer, mode='min', factor=0.5, patience=10, verbose=True
+    )
+
+    # Modified label values with smoothing
+    self.real_label_val = 0.9  # Instead of 1.0
+    self.fake_label_val = 0.1  # Instead of 0.0
 
 # Discriminator Network
 class Discriminator(nn.Module):
@@ -338,7 +534,7 @@ class AnimeGeneratorTrainer:
         logger.info(f"Initializing dataset from network path: {network_path}")
         self.dataset = AnimeDataset(network_path, image_size)
 
-        # Configure DataLoader based on device
+        # Configure DataLoader
         num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
             self.dataset,
@@ -357,13 +553,6 @@ class AnimeGeneratorTrainer:
         # Move models to appropriate device
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
-
-        # Use half precision only if CUDA is available
-        self.use_half = self.use_cuda
-        if self.use_half:
-            self.generator = self.generator.half()
-            self.discriminator = self.discriminator.half()
-            logger.info("Using FP16 (half precision) for models")
 
         # Initialize optimizers
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
@@ -429,13 +618,12 @@ class AnimeGeneratorTrainer:
             logger.error(f"Failed to save checkpoint: {e}")
 
     def train(self, num_epochs=100, save_interval=5):
-        # Initialize scaler only if CUDA is available
-        scaler = torch.cuda.amp.GradScaler() if self.use_cuda else None
+        # Initialize scaler for mixed precision training
+        scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
 
         def noisy_labels(size, value):
-            dtype = torch.float16 if self.use_half else torch.float32
-            return (torch.ones(size, 1, device=self.device, dtype=dtype) * value +
-                    torch.randn(size, 1, device=self.device, dtype=dtype) * 0.05)
+            return (torch.ones(size, 1, device=self.device) * value +
+                    torch.randn(size, 1, device=self.device) * 0.05)
 
         for epoch in range(num_epochs):
             running_d_loss = 0.0
@@ -445,28 +633,21 @@ class AnimeGeneratorTrainer:
             for batch_idx, (real_images, labels) in enumerate(pbar):
                 batch_size = real_images.size(0)
 
-                # Move data to device and convert to half if using CUDA
+                # Move data to device
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
-                if self.use_half:
-                    real_images = real_images.half()
 
                 # Train Discriminator
                 self.d_optimizer.zero_grad()
 
-                # Use context manager only if CUDA is available
-                context = torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu',
-                                             dtype=torch.float16 if self.use_half else torch.float32)
-
-                with context:
+                with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
                     # Real images
                     label_real = noisy_labels(batch_size, self.real_label_val)
                     output_real = self.discriminator(real_images, labels)
                     d_loss_real = self.criterion(output_real, label_real)
 
                     # Fake images
-                    noise = torch.randn(batch_size, self.latent_dim, device=self.device,
-                                        dtype=torch.float16 if self.use_half else torch.float32)
+                    noise = torch.randn(batch_size, self.latent_dim, device=self.device)
                     fake_images = self.generator(noise, labels)
                     label_fake = noisy_labels(batch_size, self.fake_label_val)
                     output_fake = self.discriminator(fake_images.detach(), labels)
@@ -477,6 +658,7 @@ class AnimeGeneratorTrainer:
                 if self.use_cuda:
                     scaler.scale(d_loss).backward()
                     scaler.step(self.d_optimizer)
+                    scaler.update()
                 else:
                     d_loss.backward()
                     self.d_optimizer.step()
@@ -485,9 +667,8 @@ class AnimeGeneratorTrainer:
                 if batch_idx % 2 == 0:
                     self.g_optimizer.zero_grad()
 
-                    with context:
-                        noise = torch.randn(batch_size, self.latent_dim, device=self.device,
-                                            dtype=torch.float16 if self.use_half else torch.float32)
+                    with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
+                        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
                         fake_images = self.generator(noise, labels)
                         output_fake = self.discriminator(fake_images, labels)
                         g_loss = self.criterion(output_fake, label_real)
@@ -495,14 +676,12 @@ class AnimeGeneratorTrainer:
                     if self.use_cuda:
                         scaler.scale(g_loss).backward()
                         scaler.step(self.g_optimizer)
+                        scaler.update()
                     else:
                         g_loss.backward()
                         self.g_optimizer.step()
                 else:
                     g_loss = torch.tensor(0.0, device=self.device)
-
-                if self.use_cuda:
-                    scaler.update()
 
                 # Update running losses
                 running_d_loss += d_loss.item()
@@ -530,15 +709,13 @@ class AnimeGeneratorTrainer:
                     num_samples = min(4, len(self.dataset.label_to_idx))
                     sample_labels = torch.arange(num_samples, device=self.device)
                     fake_images = self.generate_samples(num_samples, sample_labels)
-                    if self.use_half:
-                        fake_images = fake_images.float()
                     self.monitor.save_samples(fake_images, epoch + 1)
                     self.monitor.plot_losses(epoch + 1)
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
-
+            
 def main():
     # Configuration
     network_path = r"\\192.168.1.66\plex\hentai\processed_images"

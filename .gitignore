@@ -47,6 +47,8 @@
 # CMake
 cmake-build-*/
 
+processed_cache/
+
 # Mongo Explorer plugin
 .idea/**/mongoSettings.xml
 
