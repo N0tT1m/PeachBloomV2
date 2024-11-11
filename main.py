@@ -592,54 +592,34 @@ class Discriminator(nn.Module):
 
 
 class AnimeGeneratorTrainer:
-    def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
-                 lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
-        self.background_processor = BackgroundProcessor()
+    def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 128,  # increased from 100
+                 lr: float = 0.0001,  # reduced from 0.0002 for stability
+                 image_size: int = 128, local_cache_dir: Optional[str] = None):
+        # ... existing initialization code ...
 
-        # Check CUDA availability properly
-        self.use_cuda = torch.cuda.is_available()
-        if self.use_cuda:
-            torch.backends.cudnn.benchmark = True
-            self.device = torch.device("cuda:0")
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-            logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        else:
-            self.device = torch.device("cpu")
-            logger.warning("CUDA is not available. Running on CPU!")
-
-        self.latent_dim = latent_dim
-        self.image_size = image_size
-        self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
-        self.background_processor = BackgroundProcessor()
-
-        # Initialize dataset and dataloader
-        self.dataset = AnimeDataset(network_path, image_size)
-        num_workers = 4 if self.use_cuda else 0
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=self.use_cuda,
-            persistent_workers=True if num_workers > 0 else False,
-            prefetch_factor=2 if num_workers > 0 else None
+        # Update optimizers with different learning rates for G and D
+        self.g_optimizer = optim.Adam(
+            self.generator.parameters(),
+            lr=lr * 0.5,  # Generator learns slower
+            betas=(0.5, 0.999)
+        )
+        self.d_optimizer = optim.Adam(
+            self.discriminator.parameters(),
+            lr=lr * 2.0,  # Discriminator learns faster
+            betas=(0.5, 0.999)
         )
 
-        # Initialize networks
-        self.generator = Generator(latent_dim, len(self.dataset.label_to_idx))
-        self.discriminator = Discriminator(len(self.dataset.label_to_idx))
+        # Add learning rate schedulers
+        self.g_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.g_optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
+        self.d_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.d_optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
 
-        # Move models to device
-        self.generator = self.generator.to(self.device)
-        self.discriminator = self.discriminator.to(self.device)
-
-        # Initialize optimizers with improved parameters
-        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
-        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
-
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.real_label_val = 0.9
-        self.fake_label_val = 0.0
+        # Update label values with smoothing
+        self.real_label_val = 0.9  # Instead of 1.0
+        self.fake_label_val = 0.1  # Instead of 0.0
         self.monitor = TrainingMonitor()
 
         # Log GPU memory usage after initialization
@@ -726,11 +706,15 @@ class AnimeGeneratorTrainer:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    def train(self, num_epochs=100, save_interval=5):
+    def train(self, num_epochs=500, save_interval=5):
         # Initialize scaler for mixed precision training
         scaler = torch.amp.GradScaler() if self.use_cuda else None
 
+        self.current_epoch = 0
+        self.current_batch = 0
+
         for epoch in range(num_epochs):
+            self.current_epoch = epoch
             running_d_loss = 0.0
             running_g_loss = 0.0
 
@@ -802,43 +786,101 @@ class AnimeGeneratorTrainer:
                 self.save_checkpoint(epoch + 1)
                 self.monitor.plot_losses(epoch + 1)
 
+            # Calculate average losses for the epoch
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
+
+            # Add scheduler steps here, after calculating average losses
+            self.g_scheduler.step(avg_g_loss)
+            self.d_scheduler.step(avg_d_loss)
+
+            # Log training progress
             logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
-    def train_step(self, real_images, labels):
-        """Modified training step with background processing"""
+    # Add gradient penalty computation
+    def compute_gradient_penalty(self, real_images, fake_images, labels):
         batch_size = real_images.size(0)
+        alpha = torch.rand(batch_size, 1, 1, 1, device=self.device)
+        alpha = alpha.expand_as(real_images)
+
+        interpolated = alpha * real_images + (1 - alpha) * fake_images
+        interpolated.requires_grad_(True)
+
+        d_interpolated = self.discriminator(interpolated, labels)
+
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated,
+            inputs=interpolated,
+            grad_outputs=torch.ones_like(d_interpolated),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        gradients = gradients.view(batch_size, -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
+        return gradient_penalty
+
+    def train_step(self, real_images, labels):
+        batch_size = real_images.size(0)
+
+        # Add noise to labels for regularization
+        real_labels = torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        fake_labels = torch.zeros(batch_size, 1, device=self.device) * self.fake_label_val
+
+        # Add label noise
+        label_noise = 0.05
+        real_labels += torch.randn_like(real_labels) * label_noise
+        fake_labels += torch.randn_like(fake_labels) * label_noise
 
         # Train discriminator
         self.d_optimizer.zero_grad()
 
+        # Add noise to real images for regularization
+        real_images_noisy = real_images + torch.randn_like(real_images) * 0.05
+
+        # Generate fake images with varied noise
         noise = torch.randn(batch_size, self.latent_dim, device=self.device)
+        noise = noise + torch.randn_like(noise) * 0.05  # Add noise to latent space
+
         fake_images = self.generator(noise, labels)
         processed_fake = self.background_processor.process_image(fake_images)
 
+        # Use instance noise (reduces to 0 over time)
+        instance_noise = 0.05 * (1 - min(self.current_epoch / 50, 1))
+        real_images_noisy += torch.randn_like(real_images) * instance_noise
+        processed_fake += torch.randn_like(processed_fake) * instance_noise
+
         d_loss_real = self.criterion(
-            self.discriminator(real_images, labels),
-            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+            self.discriminator(real_images_noisy, labels),
+            real_labels
         )
         d_loss_fake = self.criterion(
             self.discriminator(processed_fake.detach(), labels),
-            torch.zeros(batch_size, 1, device=self.device)
+            fake_labels
         )
 
-        d_loss = (d_loss_real + d_loss_fake) * 0.5
+        # Add gradient penalty
+        gradient_penalty = self.compute_gradient_penalty(real_images, processed_fake.detach(), labels)
+
+        d_loss = (d_loss_real + d_loss_fake) * 0.5 + 10.0 * gradient_penalty
         d_loss.backward()
+
+        # Clip gradients for stability
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         self.d_optimizer.step()
 
-        # Train generator
-        self.g_optimizer.zero_grad()
-        g_loss = self.criterion(
-            self.discriminator(processed_fake, labels),
-            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
-        )
-        g_loss.backward()
-        self.g_optimizer.step()
+        # Train generator (less frequently than discriminator)
+        if self.current_batch % 2 == 0:  # Train G every other batch
+            self.g_optimizer.zero_grad()
+            g_loss = self.criterion(
+                self.discriminator(processed_fake, labels),
+                real_labels  # Use real labels for generator training
+            )
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+            self.g_optimizer.step()
 
         return d_loss.item(), g_loss.item()
 
