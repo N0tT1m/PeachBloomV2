@@ -24,6 +24,13 @@ import torch
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 
+# Add this context manager helper at the module level
+from contextlib import contextmanager
+
+@contextmanager
+def nullcontext():
+    yield
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -661,6 +668,7 @@ def improved_training_setup(self):
 
 
 # Discriminator Network
+# Modified Discriminator class
 class Discriminator(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -685,16 +693,14 @@ class Discriminator(nn.Module):
             nn.Flatten()
         )
 
-        self.output = nn.Sequential(
-            nn.Linear(256 * 8 * 8 + 50, 1),
-            nn.Sigmoid()
-        )
+        # Remove sigmoid from output layer - we'll apply it separately
+        self.output = nn.Linear(256 * 8 * 8 + 50, 1)
 
     def forward(self, x, labels):
         features = self.model(x)
         label_embedding = self.label_embedding(labels)
         combined = torch.cat([features, label_embedding], dim=1)
-        return self.output(combined)
+        return torch.sigmoid(self.output(combined)).squeeze(1)  # Ensure output is properly shaped
 
 
 class AnimeGeneratorTrainer:
@@ -1179,17 +1185,22 @@ class AnimeGeneratorTrainer:
 
         return gradient_penalty
 
+    # Modified train_step method
     def train_step(self, real_images, labels):
         batch_size = real_images.size(0)
 
-        # Add noise to labels for regularization
-        real_labels = torch.ones(batch_size, 1, device=self.device) * self.real_label_val
-        fake_labels = torch.zeros(batch_size, 1, device=self.device) * self.fake_label_val
+        # Create labels with proper shape
+        real_labels = torch.full((batch_size,), self.real_label_val, device=self.device)
+        fake_labels = torch.full((batch_size,), self.fake_label_val, device=self.device)
 
         # Add label noise
         label_noise = 0.05
         real_labels += torch.randn_like(real_labels) * label_noise
         fake_labels += torch.randn_like(fake_labels) * label_noise
+
+        # Clamp labels to valid range for BCE
+        real_labels = torch.clamp(real_labels, 0.0, 1.0)
+        fake_labels = torch.clamp(fake_labels, 0.0, 1.0)
 
         # Train discriminator
         self.d_optimizer.zero_grad()
@@ -1199,29 +1210,34 @@ class AnimeGeneratorTrainer:
 
         # Generate fake images with varied noise
         noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-        noise = noise + torch.randn_like(noise) * 0.05  # Add noise to latent space
+        noise = noise + torch.randn_like(noise) * 0.05
 
-        fake_images = self.generator(noise, labels)
-        processed_fake = self.background_processor.process_image(fake_images)
+        with torch.cuda.amp.autocast() if self.use_cuda else nullcontext():
+            fake_images = self.generator(noise, labels)
+            processed_fake = self.background_processor.process_image(fake_images)
 
-        # Use instance noise (reduces to 0 over time)
-        instance_noise = 0.05 * (1 - min(self.current_epoch / 50, 1))
-        real_images_noisy += torch.randn_like(real_images) * instance_noise
-        processed_fake += torch.randn_like(processed_fake) * instance_noise
+            # Use instance noise (reduces to 0 over time)
+            instance_noise = 0.05 * (1 - min(self.current_epoch / 50, 1))
+            real_images_noisy += torch.randn_like(real_images) * instance_noise
+            processed_fake += torch.randn_like(processed_fake) * instance_noise
 
-        d_loss_real = self.criterion(
-            self.discriminator(real_images_noisy, labels),
-            real_labels
-        )
-        d_loss_fake = self.criterion(
-            self.discriminator(processed_fake.detach(), labels),
-            fake_labels
-        )
+            # Get discriminator outputs
+            d_real = self.discriminator(real_images_noisy, labels)
+            d_fake = self.discriminator(processed_fake.detach(), labels)
 
-        # Add gradient penalty
-        gradient_penalty = self.compute_gradient_penalty(real_images, processed_fake.detach(), labels)
+            # Ensure outputs are properly shaped and valid
+            d_real = torch.clamp(d_real, 1e-7, 1 - 1e-7)
+            d_fake = torch.clamp(d_fake, 1e-7, 1 - 1e-7)
 
-        d_loss = (d_loss_real + d_loss_fake) * 0.5 + 10.0 * gradient_penalty
+            # Calculate losses
+            d_loss_real = self.criterion(d_real, real_labels)
+            d_loss_fake = self.criterion(d_fake, fake_labels)
+
+            # Add gradient penalty
+            gradient_penalty = self.compute_gradient_penalty(real_images, processed_fake.detach(), labels)
+
+            d_loss = (d_loss_real + d_loss_fake) * 0.5 + 10.0 * gradient_penalty
+
         d_loss.backward()
 
         # Clip gradients for stability
@@ -1229,12 +1245,15 @@ class AnimeGeneratorTrainer:
         self.d_optimizer.step()
 
         # Train generator (less frequently than discriminator)
+        g_loss = torch.tensor(0.0, device=self.device)
         if self.current_batch % 2 == 0:  # Train G every other batch
             self.g_optimizer.zero_grad()
-            g_loss = self.criterion(
-                self.discriminator(processed_fake, labels),
-                real_labels  # Use real labels for generator training
-            )
+
+            with torch.cuda.amp.autocast() if self.use_cuda else nullcontext():
+                g_out = self.discriminator(processed_fake, labels)
+                g_out = torch.clamp(g_out, 1e-7, 1 - 1e-7)
+                g_loss = self.criterion(g_out, real_labels)
+
             g_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
             self.g_optimizer.step()
