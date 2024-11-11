@@ -698,21 +698,56 @@ class Discriminator(nn.Module):
 
 
 class AnimeGeneratorTrainer:
-    def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 128,  # increased from 100
-                 lr: float = 0.0001,  # reduced from 0.0002 for stability
-                 image_size: int = 128, local_cache_dir: Optional[str] = None):
-        # ... existing initialization code ...
+    def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
+                 lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
+        # First check CUDA
+        self.use_cuda = torch.cuda.is_available()
+        if self.use_cuda:
+            torch.backends.cudnn.benchmark = True
+            self.device = torch.device("cuda:0")
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            self.device = torch.device("cpu")
+            logger.warning("CUDA is not available. Running on CPU!")
 
-        # Update optimizers with different learning rates for G and D
+        self.latent_dim = latent_dim
+        self.image_size = image_size
+        self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
+        self.background_processor = BackgroundProcessor()
+
+        # Initialize dataset and dataloader first
+        self.dataset = AnimeDataset(network_path, image_size)
+        num_workers = 4 if self.use_cuda else 0
+        self.dataloader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=self.use_cuda,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+
+        # Initialize networks
+        self.generator = Generator(latent_dim, len(self.dataset.label_to_idx))
+        self.discriminator = Discriminator(len(self.dataset.label_to_idx))
+
+        # Move models to device
+        self.generator = self.generator.to(self.device)
+        self.discriminator = self.discriminator.to(self.device)
+
+        # Initialize optimizers AFTER models are created and moved to device
+        params = get_improved_training_params()
         self.g_optimizer = optim.Adam(
             self.generator.parameters(),
-            lr=lr * 0.5,  # Generator learns slower
-            betas=(0.5, 0.999)
+            lr=params['g_lr'],
+            betas=(params['beta1'], params['beta2'])
         )
         self.d_optimizer = optim.Adam(
             self.discriminator.parameters(),
-            lr=lr * 2.0,  # Discriminator learns faster
-            betas=(0.5, 0.999)
+            lr=params['d_lr'],
+            betas=(params['beta1'], params['beta2'])
         )
 
         # Add learning rate schedulers
@@ -723,9 +758,9 @@ class AnimeGeneratorTrainer:
             self.d_optimizer, mode='min', factor=0.5, patience=10, verbose=True
         )
 
-        # Update label values with smoothing
-        self.real_label_val = 0.9  # Instead of 1.0
-        self.fake_label_val = 0.1  # Instead of 0.0
+        self.criterion = nn.BCELoss()
+        self.real_label_val = 0.9  # Using label smoothing
+        self.fake_label_val = 0.0
         self.monitor = TrainingMonitor()
 
         # Log GPU memory usage after initialization
