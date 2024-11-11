@@ -79,7 +79,7 @@ class AnimeDataset(Dataset):
 
         logger.info("Scanning network directory for images...")
         self._scan_directories()
-        self._validate_and_process_images()
+        # self._validate_and_process_images()
 
     def _remove_background(self, img_path: Path) -> Image.Image:
         """Remove background from image using rembg"""
