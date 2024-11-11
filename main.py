@@ -164,7 +164,7 @@ class AnimeDataset(Dataset):
 
         logger.info("Scanning network directory for images...")
         self._scan_directories()
-        # self._validate_and_process_images()
+        self._validate_and_process_images()
 
     def _remove_background(self, img_path: Path) -> Image.Image:
         """Remove background from image using rembg"""
@@ -348,62 +348,264 @@ class AnimeDataset(Dataset):
         return len(self.image_paths)
 
 
-class TrainingMonitor:
-    def __init__(self, save_dir="training_progress"):
+import logging
+from pathlib import Path
+import time
+from datetime import datetime
+import json
+import psutil
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+import torch
+import torchvision.utils as vutils
+from typing import List, Dict, Optional, Union
+import pandas as pd
+import seaborn as sns
+
+
+class ResourceMonitor:
+    """Monitors system and GPU resources during training."""
+
+    def __init__(self):
+        self.gpu_available = torch.cuda.is_available()
+        self.metrics = {
+            'cpu_usage': [],
+            'memory_usage': [],
+            'gpu_usage': [],
+            'gpu_memory': [],
+            'timestamps': []
+        }
+
+    def update(self) -> Dict[str, float]:
+        """Collect current resource usage metrics."""
+        current_metrics = {
+            'cpu_usage': psutil.cpu_percent(),
+            'memory_usage': psutil.virtual_memory().percent,
+            'timestamp': time.time()
+        }
+
+        if self.gpu_available:
+            gpu_stats = torch.cuda.get_device_properties(0)
+            current_metrics.update({
+                'gpu_usage': torch.cuda.utilization(),
+                'gpu_memory': torch.cuda.memory_allocated() / gpu_stats.total_memory * 100
+            })
+
+        # Update historical metrics
+        for key, value in current_metrics.items():
+            if key != 'timestamp':
+                self.metrics[key].append(value)
+        self.metrics['timestamps'].append(current_metrics['timestamp'])
+
+        return current_metrics
+
+
+class TrainingLogger:
+    """Handles logging of training metrics and events."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+
+        # Set up file logging
+        logging.basicConfig(
+            filename=self.log_dir / 'training.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+        # Set up TensorBoard
+        self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
+
+        # Initialize CSV logger
+        self.csv_path = self.log_dir / 'metrics.csv'
+        self.metrics_df = pd.DataFrame()
+
+    def log_metrics(self, metrics: Dict[str, float], step: int):
+        """Log metrics to all outputs (file, TensorBoard, CSV)."""
+        # Log to TensorBoard
+        for name, value in metrics.items():
+            self.writer.add_scalar(name, value, step)
+
+        # Log to CSV
+        metrics['step'] = step
+        metrics['timestamp'] = datetime.now().isoformat()
+        self.metrics_df = pd.concat([
+            self.metrics_df,
+            pd.DataFrame([metrics])
+        ], ignore_index=True)
+        self.metrics_df.to_csv(self.csv_path, index=False)
+
+        # Log to file
+        logging.info(f"Step {step}: {json.dumps(metrics)}")
+
+
+class EnhancedTrainingMonitor:
+    """Enhanced training monitor with comprehensive logging and visualization."""
+
+    def __init__(self, save_dir: str = "training_progress"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True)
-        self.g_losses = []
-        self.d_losses = []
-        self.fid_scores = []  # We'll track FID if available
-        self.inception_scores = []  # We'll track IS if available
 
-    def update(self, g_loss, d_loss):
-        self.g_losses.append(g_loss)
-        self.d_losses.append(d_loss)
+        # Initialize components
+        self.logger = TrainingLogger(self.save_dir / 'logs')
+        self.resource_monitor = ResourceMonitor()
 
-    def plot_losses(self, epoch):
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.g_losses, label='Generator Loss')
-        plt.plot(self.d_losses, label='Discriminator Loss')
-        plt.title('Training Losses Over Time')
-        plt.xlabel('Iterations')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.savefig(self.save_dir / f'losses_epoch_{epoch}.png')
-        plt.close()
+        # Training metrics
+        self.metrics = {
+            'g_losses': [],
+            'd_losses': [],
+            'fid_scores': [],
+            'inception_scores': []
+        }
 
-    def save_samples(self, images, epoch, prefix='generated'):
-        # Save a grid of images
-        grid = make_grid(images, normalize=True)
-        save_image(grid, self.save_dir / f'{prefix}_samples_epoch_{epoch}.png')
+        self.step = 0
 
-    def check_training_quality(self, g_loss, d_loss):
-        """
-        Check if training is progressing well based on loss patterns
-        """
-        # Check for common training issues
+    def update(self, g_loss: float, d_loss: float,
+               fid_score: Optional[float] = None,
+               inception_score: Optional[float] = None):
+        """Update training metrics and resource usage."""
+        # Update training metrics
+        metrics = {
+            'g_loss': g_loss,
+            'd_loss': d_loss
+        }
+
+        if fid_score is not None:
+            metrics['fid_score'] = fid_score
+        if inception_score is not None:
+            metrics['inception_score'] = inception_score
+
+        # Update resource metrics
+        resource_metrics = self.resource_monitor.update()
+        metrics.update(resource_metrics)
+
+        # Log everything
+        self.logger.log_metrics(metrics, self.step)
+
+        # Store for internal tracking
+        self.metrics['g_losses'].append(g_loss)
+        self.metrics['d_losses'].append(d_loss)
+        if fid_score is not None:
+            self.metrics['fid_scores'].append(fid_score)
+        if inception_score is not None:
+            self.metrics['inception_scores'].append(inception_score)
+
+        self.step += 1
+
+    def plot_training_progress(self, save: bool = True) -> None:
+        """Generate comprehensive training progress plots."""
+        # Create a figure with multiple subplots
+        fig = plt.figure(figsize=(15, 10))
+        grid = plt.GridSpec(2, 2, figure=fig)
+
+        # Plot losses
+        ax1 = fig.add_subplot(grid[0, 0])
+        ax1.plot(self.metrics['g_losses'], label='Generator Loss')
+        ax1.plot(self.metrics['d_losses'], label='Discriminator Loss')
+        ax1.set_title('Training Losses')
+        ax1.set_xlabel('Steps')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+
+        # Plot resource usage
+        ax2 = fig.add_subplot(grid[0, 1])
+        ax2.plot(self.resource_monitor.metrics['cpu_usage'], label='CPU Usage (%)')
+        if self.resource_monitor.gpu_available:
+            ax2.plot(self.resource_monitor.metrics['gpu_usage'], label='GPU Usage (%)')
+        ax2.set_title('Resource Usage')
+        ax2.set_xlabel('Steps')
+        ax2.set_ylabel('Usage (%)')
+        ax2.legend()
+
+        # Plot memory usage
+        ax3 = fig.add_subplot(grid[1, 0])
+        ax3.plot(self.resource_monitor.metrics['memory_usage'], label='System Memory')
+        if self.resource_monitor.gpu_available:
+            ax3.plot(self.resource_monitor.metrics['gpu_memory'], label='GPU Memory')
+        ax3.set_title('Memory Usage')
+        ax3.set_xlabel('Steps')
+        ax3.set_ylabel('Usage (%)')
+        ax3.legend()
+
+        # Plot quality metrics if available
+        ax4 = fig.add_subplot(grid[1, 1])
+        if self.metrics['fid_scores']:
+            ax4.plot(self.metrics['fid_scores'], label='FID Score')
+        if self.metrics['inception_scores']:
+            ax4.plot(self.metrics['inception_scores'], label='Inception Score')
+        ax4.set_title('Quality Metrics')
+        ax4.set_xlabel('Steps')
+        ax4.set_ylabel('Score')
+        ax4.legend()
+
+        plt.tight_layout()
+
+        if save:
+            plt.savefig(self.save_dir / f'training_progress_{self.step}.png')
+            plt.close()
+        else:
+            plt.show()
+
+    def save_samples(self, images: torch.Tensor, prefix: str = 'generated'):
+        """Save generated image samples with metadata."""
+        # Save image grid
+        grid = vutils.make_grid(images, normalize=True)
+        vutils.save_image(grid, self.save_dir / f'{prefix}_samples_step_{self.step}.png')
+
+        # Log sample to TensorBoard
+        self.logger.writer.add_image(f'{prefix}_samples', grid, self.step)
+
+    def check_training_quality(self) -> List[str]:
+        """Enhanced training quality checks."""
         issues = []
 
-        # Check if generator is learning
-        if len(self.g_losses) > 100:  # Wait for some training history
-            recent_g_loss = np.mean(self.g_losses[-20:])
-            if recent_g_loss > np.mean(self.g_losses[:20]):
-                issues.append("Generator loss is increasing")
+        if len(self.metrics['g_losses']) > 100:
+            recent_g_loss = np.mean(self.metrics['g_losses'][-20:])
+            initial_g_loss = np.mean(self.metrics['g_losses'][:20])
 
-            # Check for mode collapse
-            if np.std(self.g_losses[-20:]) < 0.01:
+            # Check various training issues
+            if recent_g_loss > initial_g_loss * 1.5:
+                issues.append("Generator loss is significantly increasing")
+
+            if np.std(self.metrics['g_losses'][-20:]) < 0.01:
                 issues.append("Possible mode collapse detected")
 
-            # Check discriminator dominance
-            if np.mean(self.d_losses[-20:]) < 0.1:
+            recent_d_loss = np.mean(self.metrics['d_losses'][-20:])
+            if recent_d_loss < 0.1:
                 issues.append("Discriminator may be too strong")
 
-            # Check vanishing gradients
-            if abs(recent_g_loss - self.g_losses[-2]) < 1e-7:
+            if abs(recent_g_loss - self.metrics['g_losses'][-2]) < 1e-7:
                 issues.append("Possible vanishing gradients")
+
+            # Resource-related issues
+            if self.resource_monitor.gpu_available:
+                recent_gpu_usage = np.mean(self.resource_monitor.metrics['gpu_usage'][-20:])
+                if recent_gpu_usage > 95:
+                    issues.append("GPU usage consistently very high")
+
+            recent_memory_usage = np.mean(self.resource_monitor.metrics['memory_usage'][-20:])
+            if recent_memory_usage > 90:
+                issues.append("System memory usage critically high")
 
         return issues
 
+    def save_checkpoint(self):
+        """Save all monitoring data to disk."""
+        checkpoint = {
+            'metrics': self.metrics,
+            'resource_metrics': self.resource_monitor.metrics,
+            'step': self.step
+        }
+        torch.save(checkpoint, self.save_dir / f'monitor_checkpoint_{self.step}.pt')
+
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]):
+        """Load monitoring data from a checkpoint."""
+        checkpoint = torch.load(checkpoint_path)
+        self.metrics = checkpoint['metrics']
+        self.resource_monitor.metrics = checkpoint['resource_metrics']
+        self.step = checkpoint['step']
 
 # Improved Generator Network with Self-Attention and Better Architecture
 class Generator(nn.Module):
@@ -640,7 +842,7 @@ class AnimeGeneratorTrainer:
         self.criterion = nn.BCEWithLogitsLoss()
         self.real_label_val = 0.9
         self.fake_label_val = 0.0
-        self.monitor = TrainingMonitor()
+        self.monitor = EnhancedTrainingMonitor()
 
         # Log GPU memory usage after initialization
         if torch.cuda.is_available():
