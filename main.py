@@ -24,13 +24,6 @@ import torch
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 
-# Add this context manager helper at the module level
-from contextlib import contextmanager
-
-@contextmanager
-def nullcontext():
-    yield
-
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,34 +164,46 @@ class AnimeDataset(Dataset):
 
         logger.info("Scanning network directory for images...")
         self._scan_directories()
-        # self._validate_and_process_images()  # Commented out validation
+        self._validate_and_process_images()
 
-    """
     def _remove_background(self, img_path: Path) -> Image.Image:
+        """Remove background from image using rembg"""
         try:
+            # Generate cache path
             cache_path = self.cache_dir / f"{img_path.stem}_nobg.png"
 
+            # If cached version exists, load it
             if cache_path.exists():
                 return Image.open(cache_path)
 
+            # Process image and cache result
             with Image.open(img_path) as img:
+                # Convert to RGBA for transparency
                 img = img.convert('RGBA')
+                # Remove background
                 output = remove(img)
+                # Save to cache
                 output.save(cache_path)
                 return output
 
         except Exception as e:
             logger.warning(f"Failed to remove background from {img_path}: {e}")
+            # Return original image if background removal fails
             return Image.open(img_path)
 
     def _center_crop_character(self, img: Image.Image) -> Image.Image:
+        """Center crop the image around the non-transparent areas"""
         if img.mode == 'RGBA':
+            # Get alpha channel
             alpha = np.array(img.split()[-1])
+            # Find non-transparent pixels
             non_transparent = np.where(alpha > 0)
             if len(non_transparent[0]) > 0:
+                # Get bounding box
                 top, left = np.min(non_transparent[0]), np.min(non_transparent[1])
                 bottom, right = np.max(non_transparent[0]), np.max(non_transparent[1])
 
+                # Add padding
                 height, width = bottom - top, right - left
                 padding = max(height, width) // 4
 
@@ -207,10 +212,12 @@ class AnimeDataset(Dataset):
                 left = max(0, left - padding)
                 right = min(img.width, right + padding)
 
+                # Crop image
                 return img.crop((left, top, right, bottom))
         return img
 
     def _validate_and_process_images(self):
+        """Validate and process all images"""
         valid_paths = []
         valid_labels = []
 
@@ -219,10 +226,13 @@ class AnimeDataset(Dataset):
             try:
                 if self._is_valid_image(path):
                     if self.remove_bg:
+                        # Remove background and center crop
                         processed_img = self._remove_background(path)
                         processed_img = self._center_crop_character(processed_img)
 
+                        # Convert back to RGB (removing alpha channel)
                         if processed_img.mode == 'RGBA':
+                            # Create white background
                             background = Image.new('RGBA', processed_img.size, (255, 255, 255, 255))
                             background.paste(processed_img, mask=processed_img.split()[-1])
                             processed_img = background.convert('RGB')
@@ -241,7 +251,20 @@ class AnimeDataset(Dataset):
         self.labels = valid_labels
         logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
 
+    def _is_valid_image(self, path: Path) -> bool:
+        """Check if file is a valid image"""
+        try:
+            with Image.open(path) as img:
+                img.verify()  # Verify it's an image
+                # Try to load it as RGB
+                img = Image.open(path).convert('RGB')
+                return True
+        except Exception as e:
+            logger.warning(f"Invalid image file {path}: {str(e)}")
+            return False
+
     def _validate_images(self):
+        """Validate all images and remove invalid ones"""
         valid_paths = []
         valid_labels = []
 
@@ -251,23 +274,12 @@ class AnimeDataset(Dataset):
                 valid_paths.append(path)
                 valid_labels.append(label)
 
-            if idx % 100 == 0:
+            if idx % 100 == 0:  # Log progress
                 logger.info(f"Validated {idx + 1}/{len(self.image_paths)} images")
 
         self.image_paths = valid_paths
         self.labels = valid_labels
         logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
-
-    def _is_valid_image(self, path: Path) -> bool:
-        try:
-            with Image.open(path) as img:
-                img.verify()
-                img = Image.open(path).convert('RGB')
-                return True
-        except Exception as e:
-            logger.warning(f"Invalid image file {path}: {str(e)}")
-            return False
-    """
 
     def _scan_directories(self):
         """Scan directories with error handling for network issues"""
@@ -307,9 +319,8 @@ class AnimeDataset(Dataset):
                     if cache_path.exists():
                         img = Image.open(cache_path)
                     else:
-                        # img = self._remove_background(img_path)  # Commented out background removal
-                        # img = self._center_crop_character(img)   # Commented out center cropping
-                        img = Image.open(img_path)
+                        img = self._remove_background(img_path)
+                        img = self._center_crop_character(img)
                 else:
                     img = Image.open(img_path)
 
@@ -338,184 +349,60 @@ class AnimeDataset(Dataset):
 
 
 class TrainingMonitor:
-    def __init__(self, save_dir="training_progress", log_interval=10):
+    def __init__(self, save_dir="training_progress"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True)
-
-        # Create subdirectories
-        (self.save_dir / "images").mkdir(exist_ok=True)
-        (self.save_dir / "plots").mkdir(exist_ok=True)
-        (self.save_dir / "metrics").mkdir(exist_ok=True)
-
-        # Metrics tracking
         self.g_losses = []
         self.d_losses = []
-        self.g_running_avg = []
-        self.d_running_avg = []
-        self.learning_rates = {'g': [], 'd': []}
-        self.quality_metrics = {'healthy_ratio': [], 'mode_collapse_score': []}
+        self.fid_scores = []  # We'll track FID if available
+        self.inception_scores = []  # We'll track IS if available
 
-        # Training stability metrics
-        self.gradient_norms = {'g': [], 'd': []}
-        self.loss_ratios = []
-        self.log_interval = log_interval
-
-        # Setup logging
-        self.setup_logging()
-
-    def setup_logging(self):
-        # Configure detailed logging
-        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        formatter = logging.Formatter(log_format)
-
-        # File handler
-        fh = logging.FileHandler(self.save_dir / 'training.log')
-        fh.setFormatter(formatter)
-        fh.setLevel(logging.INFO)
-
-        # Stream handler
-        sh = logging.StreamHandler()
-        sh.setFormatter(formatter)
-        sh.setLevel(logging.INFO)
-
-        # Get logger
-        self.logger = logging.getLogger('GANTraining')
-        self.logger.setLevel(logging.INFO)
-        self.logger.addHandler(fh)
-        self.logger.addHandler(sh)
-
-    def update(self, g_loss, d_loss, g_lr, d_lr, g_norm=None, d_norm=None):
+    def update(self, g_loss, d_loss):
         self.g_losses.append(g_loss)
         self.d_losses.append(d_loss)
-        self.learning_rates['g'].append(g_lr)
-        self.learning_rates['d'].append(d_lr)
 
-        if g_norm is not None and d_norm is not None:
-            self.gradient_norms['g'].append(g_norm)
-            self.gradient_norms['d'].append(d_norm)
-
-        # Calculate running averages
-        window = min(50, len(self.g_losses))
-        if window > 0:
-            self.g_running_avg.append(np.mean(self.g_losses[-window:]))
-            self.d_running_avg.append(np.mean(self.d_losses[-window:]))
-
-        # Calculate loss ratio
-        if d_loss != 0:
-            self.loss_ratios.append(g_loss / d_loss)
-
-    def plot_training_progress(self, epoch):
-        plt.figure(figsize=(20, 12))
-
-        # Plot 1: Losses
-        plt.subplot(2, 2, 1)
-        plt.plot(self.g_losses[-1000:], label='Generator Loss', alpha=0.3)
-        plt.plot(self.d_losses[-1000:], label='Discriminator Loss', alpha=0.3)
-        plt.plot(self.g_running_avg[-1000:], label='G Running Avg', linewidth=2)
-        plt.plot(self.d_running_avg[-1000:], label='D Running Avg', linewidth=2)
-        plt.title('Training Losses')
+    def plot_losses(self, epoch):
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.g_losses, label='Generator Loss')
+        plt.plot(self.d_losses, label='Discriminator Loss')
+        plt.title('Training Losses Over Time')
+        plt.xlabel('Iterations')
+        plt.ylabel('Loss')
         plt.legend()
-
-        # Plot 2: Learning Rates
-        plt.subplot(2, 2, 2)
-        plt.plot(self.learning_rates['g'], label='Generator LR')
-        plt.plot(self.learning_rates['d'], label='Discriminator LR')
-        plt.title('Learning Rates')
-        plt.legend()
-
-        # Plot 3: Gradient Norms
-        plt.subplot(2, 2, 3)
-        plt.plot(self.gradient_norms['g'][-1000:], label='Generator Gradients')
-        plt.plot(self.gradient_norms['d'][-1000:], label='Discriminator Gradients')
-        plt.title('Gradient Norms')
-        plt.legend()
-
-        # Plot 4: Loss Ratios
-        plt.subplot(2, 2, 4)
-        plt.plot(self.loss_ratios[-1000:], label='G/D Loss Ratio')
-        plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.3)
-        plt.title('Generator/Discriminator Loss Ratio')
-        plt.legend()
-
-        plt.tight_layout()
-        plt.savefig(self.save_dir / "plots" / f'training_metrics_epoch_{epoch}.png')
+        plt.savefig(self.save_dir / f'losses_epoch_{epoch}.png')
         plt.close()
 
+    def save_samples(self, images, epoch, prefix='generated'):
+        # Save a grid of images
+        grid = make_grid(images, normalize=True)
+        save_image(grid, self.save_dir / f'{prefix}_samples_epoch_{epoch}.png')
+
     def check_training_quality(self, g_loss, d_loss):
-        """Enhanced training quality checks"""
+        """
+        Check if training is progressing well based on loss patterns
+        """
+        # Check for common training issues
         issues = []
 
-        # Check recent losses
-        recent_g_losses = self.g_losses[-100:] if len(self.g_losses) >= 100 else self.g_losses
-        recent_d_losses = self.d_losses[-100:] if len(self.d_losses) >= 100 else self.d_losses
+        # Check if generator is learning
+        if len(self.g_losses) > 100:  # Wait for some training history
+            recent_g_loss = np.mean(self.g_losses[-20:])
+            if recent_g_loss > np.mean(self.g_losses[:20]):
+                issues.append("Generator loss is increasing")
 
-        # Mode collapse detection
-        g_loss_std = np.std(recent_g_losses)
-        if g_loss_std < 0.01:
-            issues.append("WARNING: Possible mode collapse (low G loss variance)")
+            # Check for mode collapse
+            if np.std(self.g_losses[-20:]) < 0.01:
+                issues.append("Possible mode collapse detected")
 
-        # Discriminator dominance
-        if np.mean(recent_d_losses) < 0.1:
-            issues.append("WARNING: Discriminator too strong")
+            # Check discriminator dominance
+            if np.mean(self.d_losses[-20:]) < 0.1:
+                issues.append("Discriminator may be too strong")
 
-        # Generator weakness
-        if np.mean(recent_g_losses) > 5.0:
-            issues.append("WARNING: Generator may be struggling")
-
-        # Loss ratio instability
-        if len(self.loss_ratios) > 0:
-            recent_ratios = self.loss_ratios[-100:]
-            if np.std(recent_ratios) > 2.0:
-                issues.append("WARNING: Unstable G/D loss ratio")
-
-        # Gradient vanishing
-        if len(self.gradient_norms['g']) > 0:
-            recent_g_grads = self.gradient_norms['g'][-100:]
-            if np.mean(recent_g_grads) < 0.01:
-                issues.append("WARNING: Possible vanishing gradients in Generator")
+            # Check vanishing gradients
+            if abs(recent_g_loss - self.g_losses[-2]) < 1e-7:
+                issues.append("Possible vanishing gradients")
 
         return issues
-
-    def log_epoch_summary(self, epoch, avg_g_loss, avg_d_loss, g_lr, d_lr):
-        """Log comprehensive epoch summary"""
-        summary = [
-            f"\n{'=' * 50}",
-            f"Epoch {epoch} Summary:",
-            f"{'=' * 50}",
-            f"Average Losses:",
-            f"  Generator: {avg_g_loss:.4f}",
-            f"  Discriminator: {avg_d_loss:.4f}",
-            f"Learning Rates:",
-            f"  Generator: {g_lr:.6f}",
-            f"  Discriminator: {d_lr:.6f}",
-        ]
-
-        if len(self.gradient_norms['g']) > 0:
-            summary.extend([
-                f"Gradient Norms (avg last 100):",
-                f"  Generator: {np.mean(self.gradient_norms['g'][-100:]):.4f}",
-                f"  Discriminator: {np.mean(self.gradient_norms['d'][-100:]):.4f}"
-            ])
-
-        if len(self.loss_ratios) > 0:
-            summary.extend([
-                f"Loss Ratio (G/D):",
-                f"  Current: {self.loss_ratios[-1]:.4f}",
-                f"  Avg (last 100): {np.mean(self.loss_ratios[-100:]):.4f}"
-            ])
-
-        # Add training quality issues
-        issues = self.check_training_quality(avg_g_loss, avg_d_loss)
-        if issues:
-            summary.extend([
-                f"Training Issues Detected:",
-                *[f"  - {issue}" for issue in issues]
-            ])
-
-        summary.append(f"{'=' * 50}")
-
-        # Log the summary
-        self.logger.info('\n'.join(summary))
 
 
 # Improved Generator Network with Self-Attention and Better Architecture
@@ -668,7 +555,6 @@ def improved_training_setup(self):
 
 
 # Discriminator Network
-# Modified Discriminator class
 class Discriminator(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -693,20 +579,24 @@ class Discriminator(nn.Module):
             nn.Flatten()
         )
 
-        # Remove sigmoid from output layer - we'll apply it separately
-        self.output = nn.Linear(256 * 8 * 8 + 50, 1)
+        self.output = nn.Sequential(
+            nn.Linear(256 * 8 * 8 + 50, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x, labels):
         features = self.model(x)
         label_embedding = self.label_embedding(labels)
         combined = torch.cat([features, label_embedding], dim=1)
-        return torch.sigmoid(self.output(combined)).squeeze(1)  # Ensure output is properly shaped
+        return self.output(combined)
 
 
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
-        # First check CUDA
+        self.background_processor = BackgroundProcessor()
+
+        # Check CUDA availability properly
         self.use_cuda = torch.cuda.is_available()
         if self.use_cuda:
             torch.backends.cudnn.benchmark = True
@@ -717,17 +607,12 @@ class AnimeGeneratorTrainer:
             self.device = torch.device("cpu")
             logger.warning("CUDA is not available. Running on CPU!")
 
-        # Add training counters
-        self.current_epoch = 0
-        self.current_batch = 0
-        self.global_step = 0
-
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
         self.background_processor = BackgroundProcessor()
 
-        # Initialize dataset and dataloader first
+        # Initialize dataset and dataloader
         self.dataset = AnimeDataset(network_path, image_size)
         num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
@@ -748,29 +633,12 @@ class AnimeGeneratorTrainer:
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
 
-        # Initialize optimizers AFTER models are created and moved to device
-        params = get_improved_training_params()
-        self.g_optimizer = optim.Adam(
-            self.generator.parameters(),
-            lr=params['g_lr'],
-            betas=(params['beta1'], params['beta2'])
-        )
-        self.d_optimizer = optim.Adam(
-            self.discriminator.parameters(),
-            lr=params['d_lr'],
-            betas=(params['beta1'], params['beta2'])
-        )
+        # Initialize optimizers with improved parameters
+        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
+        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
 
-        # Add learning rate schedulers
-        self.g_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.g_optimizer, mode='min', factor=0.5, patience=10, verbose=True
-        )
-        self.d_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.d_optimizer, mode='min', factor=0.5, patience=10, verbose=True
-        )
-
-        self.criterion = nn.BCELoss()
-        self.real_label_val = 0.9  # Using label smoothing
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.real_label_val = 0.9
         self.fake_label_val = 0.0
         self.monitor = TrainingMonitor()
 
@@ -858,405 +726,119 @@ class AnimeGeneratorTrainer:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    class TrainingMonitor:
-        def __init__(self, save_dir="training_progress", log_interval=10):
-            self.save_dir = Path(save_dir)
-            self.save_dir.mkdir(exist_ok=True)
-
-            # Create subdirectories
-            (self.save_dir / "images").mkdir(exist_ok=True)
-            (self.save_dir / "plots").mkdir(exist_ok=True)
-            (self.save_dir / "metrics").mkdir(exist_ok=True)
-
-            # Metrics tracking
-            self.g_losses = []
-            self.d_losses = []
-            self.g_running_avg = []
-            self.d_running_avg = []
-            self.learning_rates = {'g': [], 'd': []}
-            self.quality_metrics = {'healthy_ratio': [], 'mode_collapse_score': []}
-
-            # Training stability metrics
-            self.gradient_norms = {'g': [], 'd': []}
-            self.loss_ratios = []
-            self.log_interval = log_interval
-
-            # Setup logging
-            self.setup_logging()
-
-        def setup_logging(self):
-            # Configure detailed logging
-            log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            formatter = logging.Formatter(log_format)
-
-            # File handler
-            fh = logging.FileHandler(self.save_dir / 'training.log')
-            fh.setFormatter(formatter)
-            fh.setLevel(logging.INFO)
-
-            # Stream handler
-            sh = logging.StreamHandler()
-            sh.setFormatter(formatter)
-            sh.setLevel(logging.INFO)
-
-            # Get logger
-            self.logger = logging.getLogger('GANTraining')
-            self.logger.setLevel(logging.INFO)
-            self.logger.addHandler(fh)
-            self.logger.addHandler(sh)
-
-        def update(self, g_loss, d_loss, g_lr, d_lr, g_norm=None, d_norm=None):
-            self.g_losses.append(g_loss)
-            self.d_losses.append(d_loss)
-            self.learning_rates['g'].append(g_lr)
-            self.learning_rates['d'].append(d_lr)
-
-            if g_norm is not None and d_norm is not None:
-                self.gradient_norms['g'].append(g_norm)
-                self.gradient_norms['d'].append(d_norm)
-
-            # Calculate running averages
-            window = min(50, len(self.g_losses))
-            if window > 0:
-                self.g_running_avg.append(np.mean(self.g_losses[-window:]))
-                self.d_running_avg.append(np.mean(self.d_losses[-window:]))
-
-            # Calculate loss ratio
-            if d_loss != 0:
-                self.loss_ratios.append(g_loss / d_loss)
-
-        def plot_training_progress(self, epoch):
-            plt.figure(figsize=(20, 12))
-
-            # Plot 1: Losses
-            plt.subplot(2, 2, 1)
-            plt.plot(self.g_losses[-1000:], label='Generator Loss', alpha=0.3)
-            plt.plot(self.d_losses[-1000:], label='Discriminator Loss', alpha=0.3)
-            plt.plot(self.g_running_avg[-1000:], label='G Running Avg', linewidth=2)
-            plt.plot(self.d_running_avg[-1000:], label='D Running Avg', linewidth=2)
-            plt.title('Training Losses')
-            plt.legend()
-
-            # Plot 2: Learning Rates
-            plt.subplot(2, 2, 2)
-            plt.plot(self.learning_rates['g'], label='Generator LR')
-            plt.plot(self.learning_rates['d'], label='Discriminator LR')
-            plt.title('Learning Rates')
-            plt.legend()
-
-            # Plot 3: Gradient Norms
-            plt.subplot(2, 2, 3)
-            plt.plot(self.gradient_norms['g'][-1000:], label='Generator Gradients')
-            plt.plot(self.gradient_norms['d'][-1000:], label='Discriminator Gradients')
-            plt.title('Gradient Norms')
-            plt.legend()
-
-            # Plot 4: Loss Ratios
-            plt.subplot(2, 2, 4)
-            plt.plot(self.loss_ratios[-1000:], label='G/D Loss Ratio')
-            plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.3)
-            plt.title('Generator/Discriminator Loss Ratio')
-            plt.legend()
-
-            plt.tight_layout()
-            plt.savefig(self.save_dir / "plots" / f'training_metrics_epoch_{epoch}.png')
-            plt.close()
-
-        def check_training_quality(self, g_loss, d_loss):
-            """Enhanced training quality checks"""
-            issues = []
-
-            # Check recent losses
-            recent_g_losses = self.g_losses[-100:] if len(self.g_losses) >= 100 else self.g_losses
-            recent_d_losses = self.d_losses[-100:] if len(self.d_losses) >= 100 else self.d_losses
-
-            # Mode collapse detection
-            g_loss_std = np.std(recent_g_losses)
-            if g_loss_std < 0.01:
-                issues.append("WARNING: Possible mode collapse (low G loss variance)")
-
-            # Discriminator dominance
-            if np.mean(recent_d_losses) < 0.1:
-                issues.append("WARNING: Discriminator too strong")
-
-            # Generator weakness
-            if np.mean(recent_g_losses) > 5.0:
-                issues.append("WARNING: Generator may be struggling")
-
-            # Loss ratio instability
-            if len(self.loss_ratios) > 0:
-                recent_ratios = self.loss_ratios[-100:]
-                if np.std(recent_ratios) > 2.0:
-                    issues.append("WARNING: Unstable G/D loss ratio")
-
-            # Gradient vanishing
-            if len(self.gradient_norms['g']) > 0:
-                recent_g_grads = self.gradient_norms['g'][-100:]
-                if np.mean(recent_g_grads) < 0.01:
-                    issues.append("WARNING: Possible vanishing gradients in Generator")
-
-            return issues
-
-        def log_epoch_summary(self, epoch, avg_g_loss, avg_d_loss, g_lr, d_lr):
-            """Log comprehensive epoch summary"""
-            summary = [
-                f"\n{'=' * 50}",
-                f"Epoch {epoch} Summary:",
-                f"{'=' * 50}",
-                f"Average Losses:",
-                f"  Generator: {avg_g_loss:.4f}",
-                f"  Discriminator: {avg_d_loss:.4f}",
-                f"Learning Rates:",
-                f"  Generator: {g_lr:.6f}",
-                f"  Discriminator: {d_lr:.6f}",
-            ]
-
-            if len(self.gradient_norms['g']) > 0:
-                summary.extend([
-                    f"Gradient Norms (avg last 100):",
-                    f"  Generator: {np.mean(self.gradient_norms['g'][-100:]):.4f}",
-                    f"  Discriminator: {np.mean(self.gradient_norms['d'][-100:]):.4f}"
-                ])
-
-            if len(self.loss_ratios) > 0:
-                summary.extend([
-                    f"Loss Ratio (G/D):",
-                    f"  Current: {self.loss_ratios[-1]:.4f}",
-                    f"  Avg (last 100): {np.mean(self.loss_ratios[-100:]):.4f}"
-                ])
-
-            # Add training quality issues
-            issues = self.check_training_quality(avg_g_loss, avg_d_loss)
-            if issues:
-                summary.extend([
-                    f"Training Issues Detected:",
-                    *[f"  - {issue}" for issue in issues]
-                ])
-
-            summary.append(f"{'=' * 50}")
-
-            # Log the summary
-            self.logger.info('\n'.join(summary))
-
-    def get_gradient_norm(self, model):
-        """Calculate gradient norm for a model"""
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
-
-    def train(self, num_epochs=500, save_interval=10, patience=30):
-        """Enhanced training loop with comprehensive monitoring"""
+    def train(self, num_epochs=500, save_interval=5):
+        # Initialize scaler for mixed precision training
         scaler = torch.amp.GradScaler() if self.use_cuda else None
 
-        best_fid = float('inf')
-        epochs_without_improvement = 0
-        best_epoch = 0
-
-        # Initialize training monitor
-        self.monitor = TrainingMonitor()
-
         for epoch in range(num_epochs):
-            self.current_epoch = epoch  # Update current epoch
-            self.current_batch = 0  # Reset batch counter for new epoch
             running_d_loss = 0.0
             running_g_loss = 0.0
-            batch_count = 0
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, (real_images, labels) in enumerate(pbar):
-                self.current_batch = batch_idx  # Update current batch
-                self.global_step += 1  # Increment global step
-
+                # Move data to device
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
 
-                # Train step
+                # Use the train_step method instead of separate G and D training
                 d_loss, g_loss = self.train_step(real_images, labels)
 
-                # Calculate gradient norms
-                g_norm = self.get_gradient_norm(self.generator)
-                d_norm = self.get_gradient_norm(self.discriminator)
-
-                # Get current learning rates
-                g_lr = self.g_optimizer.param_groups[0]['lr']
-                d_lr = self.d_optimizer.param_groups[0]['lr']
-
-                # Update monitor
-                self.monitor.update(g_loss, d_loss, g_lr, d_lr, g_norm, d_norm)
-
+                # Update running losses
                 running_d_loss += d_loss
                 running_g_loss += g_loss
-                batch_count += 1
 
-                # Update progress bar
                 if batch_idx % 10 == 0:
-                    issues = self.monitor.check_training_quality(g_loss, d_loss)
+                    self.monitor.update(g_loss, d_loss)
+
+                    # Add health monitoring
+                    training_healthy = self.monitor_training_health(
+                        g_loss,
+                        d_loss,
+                        epoch + 1,
+                        batch_idx
+                    )
+
+                    # Optional: Add automatic adjustments if training isn't healthy
+                    if not training_healthy:
+                        for param_group in self.g_optimizer.param_groups:
+                            param_group['lr'] *= 0.95
+                        for param_group in self.d_optimizer.param_groups:
+                            param_group['lr'] *= 1.05
+
+                    # Update progress bar
                     status = {
                         'D_loss': f"{d_loss:.4f}",
                         'G_loss': f"{g_loss:.4f}",
-                        'G_lr': f"{g_lr:.6f}",
-                        'D_lr': f"{d_lr:.6f}",
-                        'No Improv': epochs_without_improvement
+                        'Healthy': training_healthy
                     }
 
-                    if issues:
-                        status['Issues'] = len(issues)
-
                     if self.use_cuda:
+                        torch.cuda.empty_cache()
                         status['GPU_mem'] = f"{torch.cuda.memory_allocated() / 1e9:.2f}GB"
 
                     pbar.set_postfix(status)
 
-                # Generate samples periodically
-                if batch_idx % 500 == 0:
-                    self._generate_sample_images(epoch, batch_idx)
+                # Save progress
+                if (batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1):
+                    with torch.no_grad():
+                        # Generate samples with different backgrounds
+                        num_samples = min(4, len(self.dataset.label_to_idx))
+                        sample_labels = torch.arange(num_samples, device=self.device)
 
-            # Calculate epoch averages
-            avg_d_loss = running_d_loss / batch_count
-            avg_g_loss = running_g_loss / batch_count
+                        for bg_type in ['smooth', 'gradient', 'pattern']:
+                            generated_images = self.generate_samples(
+                                num_samples,
+                                sample_labels,
+                                background_type=bg_type
+                            )
+                            self.monitor.save_samples(
+                                generated_images,
+                                epoch + 1,
+                                prefix=f'progress_{bg_type}_bg'
+                            )
 
-            # Update schedulers
-            self.g_scheduler.step(avg_g_loss)
-            self.d_scheduler.step(avg_d_loss)
-
-            # Log epoch summary
-            self.monitor.log_epoch_summary(
-                epoch + 1,
-                avg_g_loss,
-                avg_d_loss,
-                self.g_optimizer.param_groups[0]['lr'],
-                self.d_optimizer.param_groups[0]['lr']
-            )
-
-            # Plot training progress
+            # Save checkpoint at interval
             if (epoch + 1) % save_interval == 0:
-                self.monitor.plot_training_progress(epoch + 1)
                 self.save_checkpoint(epoch + 1)
+                self.monitor.plot_losses(epoch + 1)
 
-            # Early stopping check
-            current_metric = avg_g_loss  # Or use FID score if available
-            if current_metric < best_fid:
-                best_fid = current_metric
-                epochs_without_improvement = 0
-                best_epoch = epoch
-                self.save_checkpoint(epoch + 1, is_best=True)
-            else:
-                epochs_without_improvement += 1
+            avg_d_loss = running_d_loss / len(self.dataloader)
+            avg_g_loss = running_g_loss / len(self.dataloader)
+            logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
+            logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
-            # Early stopping
-            if epochs_without_improvement >= patience:
-                self.monitor.logger.info(
-                    f"Early stopping triggered after {epoch + 1} epochs. Best epoch was {best_epoch + 1}")
-                break
-
-        # Final save and plotting
-        self.monitor.plot_training_progress(num_epochs)
-        self.save_checkpoint(num_epochs, is_best=False)
-        self.monitor.logger.info("Training completed!")
-
-        # Log training progress
-        logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
-        logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
-
-    # Add gradient penalty computation
-    def compute_gradient_penalty(self, real_images, fake_images, labels):
-        batch_size = real_images.size(0)
-        alpha = torch.rand(batch_size, 1, 1, 1, device=self.device)
-        alpha = alpha.expand_as(real_images)
-
-        interpolated = alpha * real_images + (1 - alpha) * fake_images
-        interpolated.requires_grad_(True)
-
-        d_interpolated = self.discriminator(interpolated, labels)
-
-        gradients = torch.autograd.grad(
-            outputs=d_interpolated,
-            inputs=interpolated,
-            grad_outputs=torch.ones_like(d_interpolated),
-            create_graph=True,
-            retain_graph=True,
-        )[0]
-
-        gradients = gradients.view(batch_size, -1)
-        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-
-        return gradient_penalty
-
-    # Modified train_step method
     def train_step(self, real_images, labels):
+        """Modified training step with background processing"""
         batch_size = real_images.size(0)
-
-        # Create labels with proper shape
-        real_labels = torch.full((batch_size,), self.real_label_val, device=self.device)
-        fake_labels = torch.full((batch_size,), self.fake_label_val, device=self.device)
-
-        # Add label noise
-        label_noise = 0.05
-        real_labels += torch.randn_like(real_labels) * label_noise
-        fake_labels += torch.randn_like(fake_labels) * label_noise
-
-        # Clamp labels to valid range for BCE
-        real_labels = torch.clamp(real_labels, 0.0, 1.0)
-        fake_labels = torch.clamp(fake_labels, 0.0, 1.0)
 
         # Train discriminator
         self.d_optimizer.zero_grad()
 
-        # Add noise to real images for regularization
-        real_images_noisy = real_images + torch.randn_like(real_images) * 0.05
-
-        # Generate fake images with varied noise
         noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-        noise = noise + torch.randn_like(noise) * 0.05
+        fake_images = self.generator(noise, labels)
+        processed_fake = self.background_processor.process_image(fake_images)
 
-        with torch.cuda.amp.autocast() if self.use_cuda else nullcontext():
-            fake_images = self.generator(noise, labels)
-            processed_fake = self.background_processor.process_image(fake_images)
+        d_loss_real = self.criterion(
+            self.discriminator(real_images, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        d_loss_fake = self.criterion(
+            self.discriminator(processed_fake.detach(), labels),
+            torch.zeros(batch_size, 1, device=self.device)
+        )
 
-            # Use instance noise (reduces to 0 over time)
-            instance_noise = 0.05 * (1 - min(self.current_epoch / 50, 1))
-            real_images_noisy += torch.randn_like(real_images) * instance_noise
-            processed_fake += torch.randn_like(processed_fake) * instance_noise
-
-            # Get discriminator outputs
-            d_real = self.discriminator(real_images_noisy, labels)
-            d_fake = self.discriminator(processed_fake.detach(), labels)
-
-            # Ensure outputs are properly shaped and valid
-            d_real = torch.clamp(d_real, 1e-7, 1 - 1e-7)
-            d_fake = torch.clamp(d_fake, 1e-7, 1 - 1e-7)
-
-            # Calculate losses
-            d_loss_real = self.criterion(d_real, real_labels)
-            d_loss_fake = self.criterion(d_fake, fake_labels)
-
-            # Add gradient penalty
-            gradient_penalty = self.compute_gradient_penalty(real_images, processed_fake.detach(), labels)
-
-            d_loss = (d_loss_real + d_loss_fake) * 0.5 + 10.0 * gradient_penalty
-
+        d_loss = (d_loss_real + d_loss_fake) * 0.5
         d_loss.backward()
-
-        # Clip gradients for stability
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         self.d_optimizer.step()
 
-        # Train generator (less frequently than discriminator)
-        g_loss = torch.tensor(0.0, device=self.device)
-        if self.current_batch % 2 == 0:  # Train G every other batch
-            self.g_optimizer.zero_grad()
-
-            with torch.cuda.amp.autocast() if self.use_cuda else nullcontext():
-                g_out = self.discriminator(processed_fake, labels)
-                g_out = torch.clamp(g_out, 1e-7, 1 - 1e-7)
-                g_loss = self.criterion(g_out, real_labels)
-
-            g_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-            self.g_optimizer.step()
+        # Train generator
+        self.g_optimizer.zero_grad()
+        g_loss = self.criterion(
+            self.discriminator(processed_fake, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        g_loss.backward()
+        self.g_optimizer.step()
 
         return d_loss.item(), g_loss.item()
 
