@@ -229,7 +229,7 @@ class AnimeDataset(Dataset):
             logger.error(f"Error in recursive directory scan: {e}")
             raise RuntimeError("Failed to scan directories recursively")
 
-    d def _scan_directories(self):
+    def _scan_directories(self):
         """Initial directory scan (kept for compatibility)"""
         try:
             for franchise_dir in self.root_dir.iterdir():
