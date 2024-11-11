@@ -189,6 +189,32 @@ class AnimeDataset(Dataset):
         self._scan_directories()
         self._process_and_cache_images()
 
+    def _scan_directories(self):
+        """Scan directories with error handling for network issues"""
+        try:
+            for franchise_dir in self.root_dir.iterdir():
+                if franchise_dir.is_dir():
+                    for char_dir in franchise_dir.iterdir():
+                        if char_dir.is_dir():
+                            label = f"{franchise_dir.name}/{char_dir.name}"
+                            if label not in self.label_to_idx:
+                                idx = len(self.label_to_idx)
+                                self.label_to_idx[label] = idx
+                                self.idx_to_label[idx] = label
+
+                            for img_path in char_dir.glob("*.[jp][pn][g]"):
+                                self.image_paths.append(img_path)
+                                self.labels.append(self.label_to_idx[label])
+
+            if not self.image_paths:
+                raise RuntimeError("No images found in the specified directory")
+
+            logger.info(f"Found {len(self.image_paths)} images across {len(self.label_to_idx)} categories")
+
+        except Exception as e:
+            logger.error(f"Error scanning network directory: {e}")
+            raise RuntimeError("Failed to scan network directory")
+
     def _remove_background(self, img_path: Path) -> tuple[Image.Image, Image.Image]:
         """Remove background from image using rembg and return both versions"""
         try:
