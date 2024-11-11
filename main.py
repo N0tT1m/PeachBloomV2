@@ -1236,7 +1236,7 @@ def main():
     network_path = r"\\192.168.1.66\plex\hentai\processed_images"
     local_cache_dir = "local_cache"
     batch_size = 32
-    num_epochs = 100
+    num_epochs = 500
     save_interval = 5
     image_size = 128
     latent_dim = 100
