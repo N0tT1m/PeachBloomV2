@@ -711,6 +711,11 @@ class AnimeGeneratorTrainer:
             self.device = torch.device("cpu")
             logger.warning("CUDA is not available. Running on CPU!")
 
+        # Add training counters
+        self.current_epoch = 0
+        self.current_batch = 0
+        self.global_step = 0
+
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
@@ -1048,12 +1053,17 @@ class AnimeGeneratorTrainer:
         self.monitor = TrainingMonitor()
 
         for epoch in range(num_epochs):
+            self.current_epoch = epoch  # Update current epoch
+            self.current_batch = 0  # Reset batch counter for new epoch
             running_d_loss = 0.0
             running_g_loss = 0.0
             batch_count = 0
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, (real_images, labels) in enumerate(pbar):
+                self.current_batch = batch_idx  # Update current batch
+                self.global_step += 1  # Increment global step
+
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
 
