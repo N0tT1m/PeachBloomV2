@@ -17,7 +17,7 @@ import shutil
 from pathlib import WindowsPath
 import time
 from typing import Optional
-from rembg import remove
+from rembg import remove, new_session
 import numpy as np
 from PIL import Image
 import torch
@@ -155,7 +155,7 @@ class NetworkPathHandler:
 
 
 class AnimeDataset(Dataset):
-    def __init__(self, network_path: str, image_size: int = 256, remove_bg: bool = True):
+    def __init__(self, network_path: str, image_size: int = 256, remove_bg: bool = True, store_originals: bool = True):
         self.network_handler = NetworkPathHandler(network_path)
         if not self.network_handler.wait_for_access():
             raise RuntimeError(f"Could not access network path: {network_path}")
@@ -163,6 +163,10 @@ class AnimeDataset(Dataset):
         self.root_dir = Path(network_path)
         self.image_size = image_size
         self.remove_bg = remove_bg
+        self.store_originals = store_originals
+
+        # Initialize rembg session with u2net model
+        self.rembg_session = new_session("u2net")
 
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -170,66 +174,130 @@ class AnimeDataset(Dataset):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
 
+        # Initialize cache directories
+        self.cache_dir = Path("processed_cache")
+        self.nobg_cache_dir = Path("nobg_cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        self.nobg_cache_dir.mkdir(exist_ok=True)
+
         self.image_paths = []
         self.labels = []
         self.label_to_idx = {}
         self.idx_to_label = {}
 
-        self.cache_dir = Path("processed_cache")
-        self.cache_dir.mkdir(exist_ok=True)
-
         logger.info("Scanning network directory for images...")
         self._scan_directories()
-        # self._validate_and_process_images()
+        self._process_and_cache_images()
 
-    def _remove_background(self, img_path: Path) -> Image.Image:
-        """Remove background from image using rembg"""
+    def _remove_background(self, img_path: Path) -> tuple[Image.Image, Image.Image]:
+        """Remove background from image using rembg and return both versions"""
         try:
-            # Generate cache path
-            cache_path = self.cache_dir / f"{img_path.stem}_nobg.png"
+            # Generate cache paths for both versions
+            orig_cache_path = self.cache_dir / f"{img_path.stem}_orig.png"
+            nobg_cache_path = self.nobg_cache_dir / f"{img_path.stem}_nobg.png"
 
-            # If cached version exists, load it
-            if cache_path.exists():
-                return Image.open(cache_path)
+            # Check if both cached versions exist
+            if orig_cache_path.exists() and nobg_cache_path.exists():
+                return Image.open(orig_cache_path), Image.open(nobg_cache_path)
 
-            # Process image and cache result
+            # Process image
             with Image.open(img_path) as img:
-                # Convert to RGBA for transparency
-                img = img.convert('RGBA')
-                # Remove background
-                output = remove(img)
-                # Save to cache
-                output.save(cache_path)
-                return output
+                # Convert to RGB and save original
+                orig_img = img.convert('RGB')
+                orig_img.save(orig_cache_path)
+
+                # Remove background with rembg
+                if self.remove_bg:
+                    # Convert to RGBA for transparency
+                    img_rgba = img.convert('RGBA')
+
+                    # Use rembg to remove background
+                    nobg_img = remove(
+                        img_rgba,
+                        session=self.rembg_session,
+                        alpha_matting=True,
+                        alpha_matting_foreground_threshold=240,
+                        alpha_matting_background_threshold=10,
+                        alpha_matting_erode_size=10
+                    )
+
+                    # Create white background
+                    background = Image.new('RGBA', nobg_img.size, (255, 255, 255, 255))
+                    background.paste(nobg_img, mask=nobg_img.split()[-1])
+                    nobg_img = background.convert('RGB')
+
+                    # Center crop the character
+                    nobg_img = self._center_crop_character(nobg_img)
+                else:
+                    nobg_img = orig_img.copy()
+
+                nobg_img.save(nobg_cache_path)
+                return orig_img, nobg_img
 
         except Exception as e:
             logger.warning(f"Failed to remove background from {img_path}: {e}")
-            # Return original image if background removal fails
-            return Image.open(img_path)
+            # Return original image for both if processing fails
+            with Image.open(img_path) as img:
+                orig_img = img.convert('RGB')
+                return orig_img, orig_img
+
+    def _process_and_cache_images(self):
+        """Pre-process and cache all images with progress bar"""
+        logger.info("Processing and caching images with rembg background removal...")
+        total_images = len(self.image_paths)
+
+        # Process images in batches to optimize memory usage
+        batch_size = 10
+        for i in range(0, total_images, batch_size):
+            batch_paths = self.image_paths[i:i + batch_size]
+            with tqdm(total=len(batch_paths),
+                      desc=f"Processing batch {i // batch_size + 1}/{(total_images + batch_size - 1) // batch_size}") as pbar:
+                for img_path in batch_paths:
+                    try:
+                        self._remove_background(img_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to process {img_path}: {e}")
+                    pbar.update(1)
+
+            # Clear memory after each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _center_crop_character(self, img: Image.Image) -> Image.Image:
         """Center crop the image around the non-transparent areas"""
+        # If image is RGBA, use alpha channel for cropping
         if img.mode == 'RGBA':
-            # Get alpha channel
             alpha = np.array(img.split()[-1])
-            # Find non-transparent pixels
             non_transparent = np.where(alpha > 0)
+
             if len(non_transparent[0]) > 0:
                 # Get bounding box
-                top, left = np.min(non_transparent[0]), np.min(non_transparent[1])
-                bottom, right = np.max(non_transparent[0]), np.max(non_transparent[1])
+                top = max(0, np.min(non_transparent[0]))
+                left = max(0, np.min(non_transparent[1]))
+                bottom = min(img.height, np.max(non_transparent[0]))
+                right = min(img.width, np.max(non_transparent[1]))
 
-                # Add padding
-                height, width = bottom - top, right - left
-                padding = max(height, width) // 4
+                # Add padding to maintain aspect ratio
+                height = bottom - top
+                width = right - left
+                max_dim = max(height, width)
 
-                top = max(0, top - padding)
-                bottom = min(img.height, bottom + padding)
-                left = max(0, left - padding)
-                right = min(img.width, right + padding)
+                # Calculate padding to make square
+                pad_vert = (max_dim - height) // 2
+                pad_horz = (max_dim - width) // 2
+
+                # Adjust bounds with padding
+                top = max(0, top - pad_vert)
+                bottom = min(img.height, bottom + pad_vert)
+                left = max(0, left - pad_horz)
+                right = min(img.width, right + pad_horz)
 
                 # Crop image
-                return img.crop((left, top, right, bottom))
+                cropped = img.crop((left, top, right, bottom))
+
+                # Resize to maintain consistent size
+                return cropped.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
+
         return img
 
     def _validate_and_process_images(self):
@@ -242,17 +310,14 @@ class AnimeDataset(Dataset):
             try:
                 if self._is_valid_image(path):
                     if self.remove_bg:
-                        # Remove background and center crop
-                        processed_img = self._remove_background(path)
-                        processed_img = self._center_crop_character(processed_img)
+                        # Process images with rembg
+                        orig_img, nobg_img = self._remove_background(path)
 
-                        # Convert back to RGB (removing alpha channel)
-                        if processed_img.mode == 'RGBA':
-                            # Create white background
-                            background = Image.new('RGBA', processed_img.size, (255, 255, 255, 255))
-                            background.paste(processed_img, mask=processed_img.split()[-1])
-                            processed_img = background.convert('RGB')
-
+                        # Validate processed images
+                        if nobg_img is not None:
+                            valid_paths.append(path)
+                            valid_labels.append(label)
+                    else:
                         valid_paths.append(path)
                         valid_labels.append(label)
 
@@ -267,97 +332,36 @@ class AnimeDataset(Dataset):
         self.labels = valid_labels
         logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
 
-    def _is_valid_image(self, path: Path) -> bool:
-        """Check if file is a valid image"""
-        try:
-            with Image.open(path) as img:
-                img.verify()  # Verify it's an image
-                # Try to load it as RGB
-                img = Image.open(path).convert('RGB')
-                return True
-        except Exception as e:
-            logger.warning(f"Invalid image file {path}: {str(e)}")
-            return False
-
-    def _validate_images(self):
-        """Validate all images and remove invalid ones"""
-        valid_paths = []
-        valid_labels = []
-
-        logger.info("Validating images...")
-        for idx, (path, label) in enumerate(zip(self.image_paths, self.labels)):
-            if self._is_valid_image(path):
-                valid_paths.append(path)
-                valid_labels.append(label)
-
-            if idx % 100 == 0:  # Log progress
-                logger.info(f"Validated {idx + 1}/{len(self.image_paths)} images")
-
-        self.image_paths = valid_paths
-        self.labels = valid_labels
-        logger.info(f"Kept {len(valid_paths)} valid images out of {len(self.image_paths)} total")
-
-    def _scan_directories(self):
-        """Scan directories with error handling for network issues"""
-        try:
-            for franchise_dir in self.root_dir.iterdir():
-                if franchise_dir.is_dir():
-                    for char_dir in franchise_dir.iterdir():
-                        if char_dir.is_dir():
-                            label = f"{franchise_dir.name}/{char_dir.name}"
-                            if label not in self.label_to_idx:
-                                idx = len(self.label_to_idx)
-                                self.label_to_idx[label] = idx
-                                self.idx_to_label[idx] = label
-
-                            for img_path in char_dir.glob("*.[jp][pn][g]"):
-                                self.image_paths.append(img_path)
-                                self.labels.append(self.label_to_idx[label])
-
-            if not self.image_paths:
-                raise RuntimeError("No images found in the specified directory")
-
-            logger.info(f"Found {len(self.image_paths)} images across {len(self.label_to_idx)} categories")
-
-        except Exception as e:
-            logger.error(f"Error scanning network directory: {e}")
-            raise RuntimeError("Failed to scan network directory")
-
     def __getitem__(self, idx):
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 img_path = self.image_paths[idx]
 
-                if self.remove_bg:
-                    # Load processed image from cache
-                    cache_path = self.cache_dir / f"{Path(img_path).stem}_nobg.png"
-                    if cache_path.exists():
-                        img = Image.open(cache_path)
-                    else:
-                        img = self._remove_background(img_path)
-                        img = self._center_crop_character(img)
-                else:
-                    img = Image.open(img_path)
+                # Load both versions from cache
+                orig_cache_path = self.cache_dir / f"{Path(img_path).stem}_orig.png"
+                nobg_cache_path = self.nobg_cache_dir / f"{Path(img_path).stem}_nobg.png"
 
-                # Convert to RGB
-                if img.mode == 'RGBA':
-                    background = Image.new('RGBA', img.size, (255, 255, 255, 255))
-                    background.paste(img, mask=img.split()[-1])
-                    img = background.convert('RGB')
-                else:
-                    img = img.convert('RGB')
+                if self.store_originals:
+                    # Return both original and no-background versions
+                    orig_img = Image.open(orig_cache_path)
+                    nobg_img = Image.open(nobg_cache_dir)
 
-                # Apply transformations
-                image = self.transform(img)
-                label = self.labels[idx]
-                return image, label
+                    # Apply transformations
+                    orig_tensor = self.transform(orig_img)
+                    nobg_tensor = self.transform(nobg_img)
+
+                    return orig_tensor, nobg_tensor, self.labels[idx]
+                else:
+                    # Return only no-background version
+                    nobg_img = Image.open(nobg_cache_path)
+                    nobg_tensor = self.transform(nobg_img)
+                    return nobg_tensor, self.labels[idx]
 
             except (OSError, PermissionError) as e:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to load image {img_path}: {str(e)}")
                 if attempt == max_retries - 1:
-                    new_idx = (idx + 1) % len(self)
-                    return self.__getitem__(new_idx)
+                    return self.__getitem__((idx + 1) % len(self))
                 time.sleep(1)
 
     def __len__(self):
@@ -811,10 +815,11 @@ class Discriminator(nn.Module):
 
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
-                 lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
+                 lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None,
+                 store_originals: bool = True):
         self.background_processor = BackgroundProcessor()
 
-        # Check CUDA availability properly
+        # Check CUDA availability
         self.use_cuda = torch.cuda.is_available()
         if self.use_cuda:
             torch.backends.cudnn.benchmark = True
@@ -828,10 +833,16 @@ class AnimeGeneratorTrainer:
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
-        self.background_processor = BackgroundProcessor()
+        self.store_originals = store_originals
 
-        # Initialize dataset and dataloader
-        self.dataset = AnimeDataset(network_path, image_size)
+        # Initialize dataset with background removal
+        self.dataset = AnimeDataset(
+            network_path,
+            image_size,
+            remove_bg=True,
+            store_originals=store_originals
+        )
+
         num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
             self.dataset,
@@ -851,7 +862,7 @@ class AnimeGeneratorTrainer:
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
 
-        # Initialize optimizers with improved parameters
+        # Initialize optimizers
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
 
@@ -944,46 +955,69 @@ class AnimeGeneratorTrainer:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    def train(self, num_epochs=500, save_interval=5):
-        # Initialize scaler for mixed precision training
-        scaler = torch.amp.GradScaler() if self.use_cuda else None
+    def train_step(self, data, labels):
+        """Modified training step to handle both image versions"""
+        batch_size = labels.size(0)
 
+        # Unpack data based on whether we're storing originals
+        if self.store_originals:
+            real_orig, real_nobg, labels = data
+            # Train on no-background images
+            real_images = real_nobg
+        else:
+            real_images, labels = data
+
+        # Train discriminator
+        self.d_optimizer.zero_grad()
+
+        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
+        fake_images = self.generator(noise, labels)
+
+        d_loss_real = self.criterion(
+            self.discriminator(real_images, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        d_loss_fake = self.criterion(
+            self.discriminator(fake_images.detach(), labels),
+            torch.zeros(batch_size, 1, device=self.device)
+        )
+
+        d_loss = (d_loss_real + d_loss_fake) * 0.5
+        d_loss.backward()
+        self.d_optimizer.step()
+
+        # Train generator
+        self.g_optimizer.zero_grad()
+        g_loss = self.criterion(
+            self.discriminator(fake_images, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        g_loss.backward()
+        self.g_optimizer.step()
+
+        return d_loss.item(), g_loss.item()
+
+    def train(self, num_epochs=500, save_interval=5):
         for epoch in range(num_epochs):
             running_d_loss = 0.0
             running_g_loss = 0.0
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-            for batch_idx, (real_images, labels) in enumerate(pbar):
-                # Move data to device
-                real_images = real_images.to(self.device)
-                labels = labels.to(self.device)
+            for batch_idx, batch_data in enumerate(pbar):
+                if self.store_originals:
+                    real_orig, real_nobg, labels = [item.to(self.device) for item in batch_data]
+                    d_loss, g_loss = self.train_step((real_orig, real_nobg, labels), labels)
+                else:
+                    real_images, labels = [item.to(self.device) for item in batch_data]
+                    d_loss, g_loss = self.train_step((real_images, labels), labels)
 
-                # Use the train_step method instead of separate G and D training
-                d_loss, g_loss = self.train_step(real_images, labels)
-
-                # Update running losses
                 running_d_loss += d_loss
                 running_g_loss += g_loss
 
                 if batch_idx % 10 == 0:
                     self.monitor.update(g_loss, d_loss)
+                    training_healthy = self.monitor_training_health(g_loss, d_loss, epoch + 1, batch_idx)
 
-                    # Add health monitoring
-                    training_healthy = self.monitor_training_health(
-                        g_loss,
-                        d_loss,
-                        epoch + 1,
-                        batch_idx
-                    )
-
-                    # Optional: Add automatic adjustments if training isn't healthy
-                    if not training_healthy:
-                        for param_group in self.g_optimizer.param_groups:
-                            param_group['lr'] *= 0.95
-                        for param_group in self.d_optimizer.param_groups:
-                            param_group['lr'] *= 1.05
-
-                    # Update progress bar
                     status = {
                         'D_loss': f"{d_loss:.4f}",
                         'G_loss': f"{g_loss:.4f}",
@@ -996,69 +1030,16 @@ class AnimeGeneratorTrainer:
 
                     pbar.set_postfix(status)
 
-                # Save progress
-                if (batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1):
-                    with torch.no_grad():
-                        # Generate samples with different backgrounds
-                        num_samples = min(4, len(self.dataset.label_to_idx))
-                        sample_labels = torch.arange(num_samples, device=self.device)
+                if batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1:
+                    self.save_samples(epoch, batch_idx)
 
-                        for bg_type in ['smooth', 'gradient', 'pattern']:
-                            generated_images = self.generate_samples(
-                                num_samples,
-                                sample_labels,
-                                background_type=bg_type
-                            )
-                            # Fixed save_samples call
-                            self.monitor.save_samples(
-                                generated_images,
-                                prefix=f'progress_{bg_type}_bg_step_{epoch}_{batch_idx}'
-                            )
-
-            # Save checkpoint at interval
             if (epoch + 1) % save_interval == 0:
                 self.save_checkpoint(epoch + 1)
-                self.monitor.plot_training_progress(save=True)  # Fixed method name
+                self.monitor.plot_training_progress(save=True)
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {self.monitor.check_training_quality()}")  # Fixed method call
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
-
-    def train_step(self, real_images, labels):
-        """Modified training step with background processing"""
-        batch_size = real_images.size(0)
-
-        # Train discriminator
-        self.d_optimizer.zero_grad()
-
-        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-        fake_images = self.generator(noise, labels)
-        processed_fake = self.background_processor.process_image(fake_images)
-
-        d_loss_real = self.criterion(
-            self.discriminator(real_images, labels),
-            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
-        )
-        d_loss_fake = self.criterion(
-            self.discriminator(processed_fake.detach(), labels),
-            torch.zeros(batch_size, 1, device=self.device)
-        )
-
-        d_loss = (d_loss_real + d_loss_fake) * 0.5
-        d_loss.backward()
-        self.d_optimizer.step()
-
-        # Train generator
-        self.g_optimizer.zero_grad()
-        g_loss = self.criterion(
-            self.discriminator(processed_fake, labels),
-            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
-        )
-        g_loss.backward()
-        self.g_optimizer.step()
-
-        return d_loss.item(), g_loss.item()
 
 def main():
     # Configuration
