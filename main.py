@@ -216,7 +216,7 @@ class AnimeDataset(Dataset):
             raise RuntimeError("Failed to scan network directory")
 
     def _remove_background(self, img_path: Path) -> tuple[Image.Image, Image.Image]:
-        """Remove background from image using rembg and return both versions"""
+        """Remove background from image using rembg with optimized parameters"""
         try:
             # Generate cache paths for both versions
             orig_cache_path = self.cache_dir / f"{img_path.stem}_orig.png"
@@ -237,14 +237,13 @@ class AnimeDataset(Dataset):
                     # Convert to RGBA for transparency
                     img_rgba = img.convert('RGBA')
 
-                    # Use rembg to remove background
+                    # Use rembg with modified parameters to avoid Cholesky decomposition issues
                     nobg_img = remove(
                         img_rgba,
                         session=self.rembg_session,
-                        alpha_matting=True,
-                        alpha_matting_foreground_threshold=240,
-                        alpha_matting_background_threshold=10,
-                        alpha_matting_erode_size=10
+                        alpha_matting=False,  # Disable alpha matting to avoid Cholesky decomposition
+                        only_mask=False,
+                        post_process_mask=True
                     )
 
                     # Create white background
