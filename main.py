@@ -29,93 +29,109 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# class BackgroundProcessor:
+#     def __init__(self, threshold=0.5, blur_kernel_size=5, smooth_factor=0.8):
+#         self.threshold = threshold
+#         self.blur_kernel_size = blur_kernel_size
+#         self.smooth_factor = smooth_factor
+#
+#     def apply_gaussian_smoothing(self, tensor):
+#         padding = (self.blur_kernel_size - 1) // 2
+#         gaussian_kernel = self._create_gaussian_kernel(self.blur_kernel_size)
+#         gaussian_kernel = gaussian_kernel.expand(tensor.size(1), 1, self.blur_kernel_size, self.blur_kernel_size)
+#
+#         return F.conv2d(
+#             tensor,
+#             gaussian_kernel.to(tensor.device),
+#             padding=padding,
+#             groups=tensor.size(1)
+#         )
+#
+#     def _create_gaussian_kernel(self, kernel_size, sigma=1.5):
+#         x = torch.linspace(-sigma, sigma, kernel_size)
+#         x = x.expand(kernel_size, -1)
+#         y = x.t()
+#
+#         kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+#         kernel = kernel / kernel.sum()
+#
+#         return kernel.unsqueeze(0).unsqueeze(0)
+#
+#     def get_background_mask(self, tensor):
+#         # Ensure input tensor has correct dimensions
+#         B, C, H, W = tensor.size()
+#
+#         # Convert to grayscale
+#         gray = 0.299 * tensor[:, 0] + 0.587 * tensor[:, 1] + 0.114 * tensor[:, 2]
+#
+#         # Calculate gradients
+#         dx = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 1, 0, 0), mode='replicate')
+#         dy = F.pad(gray[:, 1:, :] - gray[:, :-1, :], (0, 0, 0, 1), mode='replicate')
+#
+#         # Calculate gradient magnitude
+#         gradient_mag = torch.sqrt(dx ** 2 + dy ** 2)
+#
+#         # Create mask
+#         mask = (gradient_mag < self.threshold).float()
+#
+#         # Apply smoothing
+#         mask = self.apply_gaussian_smoothing(mask.unsqueeze(1))
+#
+#         # Ensure mask has same size as input
+#         mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
+#
+#         return mask.expand(-1, 3, -1, -1)
+#
+#     def process_image(self, tensor, background_type='smooth'):
+#         B, C, H, W = tensor.size()
+#         bg_mask = self.get_background_mask(tensor)
+#
+#         if background_type == 'smooth':
+#             bg = torch.ones_like(tensor) * 0.5
+#         elif background_type == 'gradient':
+#             gradient = torch.linspace(0, 1, W, device=tensor.device)
+#             gradient = gradient.view(1, 1, 1, -1).expand(B, C, H, W)
+#             bg = gradient
+#         else:  # pattern
+#             bg = torch.zeros_like(tensor)
+#             bg[:, :, ::4, ::4] = 1
+#
+#         # Ensure all tensors have the same size
+#         processed = (1 - bg_mask) * tensor + bg_mask * bg
+#         processed = self.apply_gaussian_smoothing(processed)
+#
+#         return processed
+#
+#     def create_smooth_background(self, tensor):
+#         return torch.ones_like(tensor) * 0.5
+#
+#     def create_gradient_background(self, tensor):
+#         h, w = tensor.shape[2:]
+#         gradient = torch.linspace(0, 1, w, device=tensor.device)
+#         gradient = gradient.view(1, 1, 1, -1).expand(tensor.shape[0], 3, h, w)
+#         return gradient
+#
+#     def create_pattern_background(self, tensor):
+#         h, w = tensor.shape[2:]
+#         pattern = torch.zeros_like(tensor)
+#         pattern[:, :, ::4, ::4] = 1
+#         return pattern
+
 class BackgroundProcessor:
-    def __init__(self, threshold=0.5, blur_kernel_size=5, smooth_factor=0.8):
-        self.threshold = threshold
-        self.blur_kernel_size = blur_kernel_size
-        self.smooth_factor = smooth_factor
+    def __init__(self):
+        pass
 
-    def apply_gaussian_smoothing(self, tensor):
-        padding = (self.blur_kernel_size - 1) // 2
-        gaussian_kernel = self._create_gaussian_kernel(self.blur_kernel_size)
-        gaussian_kernel = gaussian_kernel.expand(tensor.size(1), 1, self.blur_kernel_size, self.blur_kernel_size)
-
-        return F.conv2d(
-            tensor,
-            gaussian_kernel.to(tensor.device),
-            padding=padding,
-            groups=tensor.size(1)
-        )
-
-    def _create_gaussian_kernel(self, kernel_size, sigma=1.5):
-        x = torch.linspace(-sigma, sigma, kernel_size)
-        x = x.expand(kernel_size, -1)
-        y = x.t()
-
-        kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
-        kernel = kernel / kernel.sum()
-
-        return kernel.unsqueeze(0).unsqueeze(0)
-
-    def get_background_mask(self, tensor):
-        # Ensure input tensor has correct dimensions
-        B, C, H, W = tensor.size()
-
-        # Convert to grayscale
-        gray = 0.299 * tensor[:, 0] + 0.587 * tensor[:, 1] + 0.114 * tensor[:, 2]
-
-        # Calculate gradients
-        dx = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 1, 0, 0), mode='replicate')
-        dy = F.pad(gray[:, 1:, :] - gray[:, :-1, :], (0, 0, 0, 1), mode='replicate')
-
-        # Calculate gradient magnitude
-        gradient_mag = torch.sqrt(dx ** 2 + dy ** 2)
-
-        # Create mask
-        mask = (gradient_mag < self.threshold).float()
-
-        # Apply smoothing
-        mask = self.apply_gaussian_smoothing(mask.unsqueeze(1))
-
-        # Ensure mask has same size as input
-        mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
-
-        return mask.expand(-1, 3, -1, -1)
-
-    def process_image(self, tensor, background_type='smooth'):
-        B, C, H, W = tensor.size()
-        bg_mask = self.get_background_mask(tensor)
-
-        if background_type == 'smooth':
-            bg = torch.ones_like(tensor) * 0.5
-        elif background_type == 'gradient':
-            gradient = torch.linspace(0, 1, W, device=tensor.device)
-            gradient = gradient.view(1, 1, 1, -1).expand(B, C, H, W)
-            bg = gradient
-        else:  # pattern
-            bg = torch.zeros_like(tensor)
-            bg[:, :, ::4, ::4] = 1
-
-        # Ensure all tensors have the same size
-        processed = (1 - bg_mask) * tensor + bg_mask * bg
-        processed = self.apply_gaussian_smoothing(processed)
-
-        return processed
+    def process_image(self, tensor, background_type=None):
+        # Simply return the tensor unchanged
+        return tensor
 
     def create_smooth_background(self, tensor):
-        return torch.ones_like(tensor) * 0.5
-
-    def create_gradient_background(self, tensor):
-        h, w = tensor.shape[2:]
-        gradient = torch.linspace(0, 1, w, device=tensor.device)
-        gradient = gradient.view(1, 1, 1, -1).expand(tensor.shape[0], 3, h, w)
-        return gradient
+        # Return unchanged
+        return tensor
 
     def create_pattern_background(self, tensor):
-        h, w = tensor.shape[2:]
-        pattern = torch.zeros_like(tensor)
-        pattern[:, :, ::4, ::4] = 1
-        return pattern
+        # Return unchanged
+        return tensor
 
 class NetworkPathHandler:
     def __init__(self, network_path: str, max_retries: int = 3, retry_delay: int = 5):
