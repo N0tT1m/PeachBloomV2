@@ -993,20 +993,20 @@ class AnimeGeneratorTrainer:
                                 sample_labels,
                                 background_type=bg_type
                             )
+                            # Fixed save_samples call
                             self.monitor.save_samples(
                                 generated_images,
-                                epoch + 1,
-                                prefix=f'progress_{bg_type}_bg'
+                                prefix=f'progress_{bg_type}_bg_step_{epoch}_{batch_idx}'
                             )
 
             # Save checkpoint at interval
             if (epoch + 1) % save_interval == 0:
                 self.save_checkpoint(epoch + 1)
-                self.monitor.plot_losses(epoch + 1)
+                self.monitor.plot_training_progress(save=True)  # Fixed method name
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
+            logger.info(f"Issues: {self.monitor.check_training_quality()}")  # Fixed method call
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
     def train_step(self, real_images, labels):
