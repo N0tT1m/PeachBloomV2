@@ -21,12 +21,101 @@ from rembg import remove
 import numpy as np
 from PIL import Image
 import torch
-import torchvision.transforms.functional as F
+import torchvision.transforms.functional as TF
+import torch.nn.functional as F
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class BackgroundProcessor:
+    def __init__(self, threshold=0.5, blur_kernel_size=5, smooth_factor=0.8):
+        self.threshold = threshold
+        self.blur_kernel_size = blur_kernel_size
+        self.smooth_factor = smooth_factor
+
+    def apply_gaussian_smoothing(self, tensor):
+        padding = (self.blur_kernel_size - 1) // 2
+        gaussian_kernel = self._create_gaussian_kernel(self.blur_kernel_size)
+        gaussian_kernel = gaussian_kernel.expand(tensor.size(1), 1, self.blur_kernel_size, self.blur_kernel_size)
+
+        return F.conv2d(
+            tensor,
+            gaussian_kernel.to(tensor.device),
+            padding=padding,
+            groups=tensor.size(1)
+        )
+
+    def _create_gaussian_kernel(self, kernel_size, sigma=1.5):
+        x = torch.linspace(-sigma, sigma, kernel_size)
+        x = x.expand(kernel_size, -1)
+        y = x.t()
+
+        kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+        kernel = kernel / kernel.sum()
+
+        return kernel.unsqueeze(0).unsqueeze(0)
+
+    def get_background_mask(self, tensor):
+        # Ensure input tensor has correct dimensions
+        B, C, H, W = tensor.size()
+
+        # Convert to grayscale
+        gray = 0.299 * tensor[:, 0] + 0.587 * tensor[:, 1] + 0.114 * tensor[:, 2]
+
+        # Calculate gradients
+        dx = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 1, 0, 0), mode='replicate')
+        dy = F.pad(gray[:, 1:, :] - gray[:, :-1, :], (0, 0, 0, 1), mode='replicate')
+
+        # Calculate gradient magnitude
+        gradient_mag = torch.sqrt(dx ** 2 + dy ** 2)
+
+        # Create mask
+        mask = (gradient_mag < self.threshold).float()
+
+        # Apply smoothing
+        mask = self.apply_gaussian_smoothing(mask.unsqueeze(1))
+
+        # Ensure mask has same size as input
+        mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
+
+        return mask.expand(-1, 3, -1, -1)
+
+    def process_image(self, tensor, background_type='smooth'):
+        B, C, H, W = tensor.size()
+        bg_mask = self.get_background_mask(tensor)
+
+        if background_type == 'smooth':
+            bg = torch.ones_like(tensor) * 0.5
+        elif background_type == 'gradient':
+            gradient = torch.linspace(0, 1, W, device=tensor.device)
+            gradient = gradient.view(1, 1, 1, -1).expand(B, C, H, W)
+            bg = gradient
+        else:  # pattern
+            bg = torch.zeros_like(tensor)
+            bg[:, :, ::4, ::4] = 1
+
+        # Ensure all tensors have the same size
+        processed = (1 - bg_mask) * tensor + bg_mask * bg
+        processed = self.apply_gaussian_smoothing(processed)
+
+        return processed
+
+    def create_smooth_background(self, tensor):
+        return torch.ones_like(tensor) * 0.5
+
+    def create_gradient_background(self, tensor):
+        h, w = tensor.shape[2:]
+        gradient = torch.linspace(0, 1, w, device=tensor.device)
+        gradient = gradient.view(1, 1, 1, -1).expand(tensor.shape[0], 3, h, w)
+        return gradient
+
+    def create_pattern_background(self, tensor):
+        h, w = tensor.shape[2:]
+        pattern = torch.zeros_like(tensor)
+        pattern[:, :, ::4, ::4] = 1
+        return pattern
 
 class NetworkPathHandler:
     def __init__(self, network_path: str, max_retries: int = 3, retry_delay: int = 5):
@@ -35,14 +124,12 @@ class NetworkPathHandler:
         self.retry_delay = retry_delay
 
     def check_path_accessible(self) -> bool:
-        """Check if network path is accessible"""
         try:
             return self.network_path.exists()
         except (PermissionError, OSError):
             return False
 
     def wait_for_access(self) -> bool:
-        """Wait for network path to become accessible"""
         for attempt in range(self.max_retries):
             if self.check_path_accessible():
                 return True
@@ -61,7 +148,6 @@ class AnimeDataset(Dataset):
         self.image_size = image_size
         self.remove_bg = remove_bg
 
-        # Modified transform pipeline
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -73,7 +159,6 @@ class AnimeDataset(Dataset):
         self.label_to_idx = {}
         self.idx_to_label = {}
 
-        # Create cache directory for processed images
         self.cache_dir = Path("processed_cache")
         self.cache_dir.mkdir(exist_ok=True)
 
@@ -263,62 +348,264 @@ class AnimeDataset(Dataset):
         return len(self.image_paths)
 
 
-class TrainingMonitor:
-    def __init__(self, save_dir="training_progress"):
+import logging
+from pathlib import Path
+import time
+from datetime import datetime
+import json
+import psutil
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+import torch
+import torchvision.utils as vutils
+from typing import List, Dict, Optional, Union
+import pandas as pd
+import seaborn as sns
+
+
+class ResourceMonitor:
+    """Monitors system and GPU resources during training."""
+
+    def __init__(self):
+        self.gpu_available = torch.cuda.is_available()
+        self.metrics = {
+            'cpu_usage': [],
+            'memory_usage': [],
+            'gpu_usage': [],
+            'gpu_memory': [],
+            'timestamps': []
+        }
+
+    def update(self) -> Dict[str, float]:
+        """Collect current resource usage metrics."""
+        current_metrics = {
+            'cpu_usage': psutil.cpu_percent(),
+            'memory_usage': psutil.virtual_memory().percent,
+            'timestamp': time.time()
+        }
+
+        if self.gpu_available:
+            gpu_stats = torch.cuda.get_device_properties(0)
+            current_metrics.update({
+                'gpu_usage': torch.cuda.utilization(),
+                'gpu_memory': torch.cuda.memory_allocated() / gpu_stats.total_memory * 100
+            })
+
+        # Update historical metrics
+        for key, value in current_metrics.items():
+            if key != 'timestamp':
+                self.metrics[key].append(value)
+        self.metrics['timestamps'].append(current_metrics['timestamp'])
+
+        return current_metrics
+
+
+class TrainingLogger:
+    """Handles logging of training metrics and events."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+
+        # Set up file logging
+        logging.basicConfig(
+            filename=self.log_dir / 'training.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+        # Set up TensorBoard
+        self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
+
+        # Initialize CSV logger
+        self.csv_path = self.log_dir / 'metrics.csv'
+        self.metrics_df = pd.DataFrame()
+
+    def log_metrics(self, metrics: Dict[str, float], step: int):
+        """Log metrics to all outputs (file, TensorBoard, CSV)."""
+        # Log to TensorBoard
+        for name, value in metrics.items():
+            self.writer.add_scalar(name, value, step)
+
+        # Log to CSV
+        metrics['step'] = step
+        metrics['timestamp'] = datetime.now().isoformat()
+        self.metrics_df = pd.concat([
+            self.metrics_df,
+            pd.DataFrame([metrics])
+        ], ignore_index=True)
+        self.metrics_df.to_csv(self.csv_path, index=False)
+
+        # Log to file
+        logging.info(f"Step {step}: {json.dumps(metrics)}")
+
+
+class EnhancedTrainingMonitor:
+    """Enhanced training monitor with comprehensive logging and visualization."""
+
+    def __init__(self, save_dir: str = "training_progress"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True)
-        self.g_losses = []
-        self.d_losses = []
-        self.fid_scores = []  # We'll track FID if available
-        self.inception_scores = []  # We'll track IS if available
 
-    def update(self, g_loss, d_loss):
-        self.g_losses.append(g_loss)
-        self.d_losses.append(d_loss)
+        # Initialize components
+        self.logger = TrainingLogger(self.save_dir / 'logs')
+        self.resource_monitor = ResourceMonitor()
 
-    def plot_losses(self, epoch):
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.g_losses, label='Generator Loss')
-        plt.plot(self.d_losses, label='Discriminator Loss')
-        plt.title('Training Losses Over Time')
-        plt.xlabel('Iterations')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.savefig(self.save_dir / f'losses_epoch_{epoch}.png')
-        plt.close()
+        # Training metrics
+        self.metrics = {
+            'g_losses': [],
+            'd_losses': [],
+            'fid_scores': [],
+            'inception_scores': []
+        }
 
-    def save_samples(self, images, epoch, prefix='generated'):
-        # Save a grid of images
-        grid = make_grid(images, normalize=True)
-        save_image(grid, self.save_dir / f'{prefix}_samples_epoch_{epoch}.png')
+        self.step = 0
 
-    def check_training_quality(self, g_loss, d_loss):
-        """
-        Check if training is progressing well based on loss patterns
-        """
-        # Check for common training issues
+    def update(self, g_loss: float, d_loss: float,
+               fid_score: Optional[float] = None,
+               inception_score: Optional[float] = None):
+        """Update training metrics and resource usage."""
+        # Update training metrics
+        metrics = {
+            'g_loss': g_loss,
+            'd_loss': d_loss
+        }
+
+        if fid_score is not None:
+            metrics['fid_score'] = fid_score
+        if inception_score is not None:
+            metrics['inception_score'] = inception_score
+
+        # Update resource metrics
+        resource_metrics = self.resource_monitor.update()
+        metrics.update(resource_metrics)
+
+        # Log everything
+        self.logger.log_metrics(metrics, self.step)
+
+        # Store for internal tracking
+        self.metrics['g_losses'].append(g_loss)
+        self.metrics['d_losses'].append(d_loss)
+        if fid_score is not None:
+            self.metrics['fid_scores'].append(fid_score)
+        if inception_score is not None:
+            self.metrics['inception_scores'].append(inception_score)
+
+        self.step += 1
+
+    def plot_training_progress(self, save: bool = True) -> None:
+        """Generate comprehensive training progress plots."""
+        # Create a figure with multiple subplots
+        fig = plt.figure(figsize=(15, 10))
+        grid = plt.GridSpec(2, 2, figure=fig)
+
+        # Plot losses
+        ax1 = fig.add_subplot(grid[0, 0])
+        ax1.plot(self.metrics['g_losses'], label='Generator Loss')
+        ax1.plot(self.metrics['d_losses'], label='Discriminator Loss')
+        ax1.set_title('Training Losses')
+        ax1.set_xlabel('Steps')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+
+        # Plot resource usage
+        ax2 = fig.add_subplot(grid[0, 1])
+        ax2.plot(self.resource_monitor.metrics['cpu_usage'], label='CPU Usage (%)')
+        if self.resource_monitor.gpu_available:
+            ax2.plot(self.resource_monitor.metrics['gpu_usage'], label='GPU Usage (%)')
+        ax2.set_title('Resource Usage')
+        ax2.set_xlabel('Steps')
+        ax2.set_ylabel('Usage (%)')
+        ax2.legend()
+
+        # Plot memory usage
+        ax3 = fig.add_subplot(grid[1, 0])
+        ax3.plot(self.resource_monitor.metrics['memory_usage'], label='System Memory')
+        if self.resource_monitor.gpu_available:
+            ax3.plot(self.resource_monitor.metrics['gpu_memory'], label='GPU Memory')
+        ax3.set_title('Memory Usage')
+        ax3.set_xlabel('Steps')
+        ax3.set_ylabel('Usage (%)')
+        ax3.legend()
+
+        # Plot quality metrics if available
+        ax4 = fig.add_subplot(grid[1, 1])
+        if self.metrics['fid_scores']:
+            ax4.plot(self.metrics['fid_scores'], label='FID Score')
+        if self.metrics['inception_scores']:
+            ax4.plot(self.metrics['inception_scores'], label='Inception Score')
+        ax4.set_title('Quality Metrics')
+        ax4.set_xlabel('Steps')
+        ax4.set_ylabel('Score')
+        ax4.legend()
+
+        plt.tight_layout()
+
+        if save:
+            plt.savefig(self.save_dir / f'training_progress_{self.step}.png')
+            plt.close()
+        else:
+            plt.show()
+
+    def save_samples(self, images: torch.Tensor, prefix: str = 'generated'):
+        """Save generated image samples with metadata."""
+        # Save image grid
+        grid = vutils.make_grid(images, normalize=True)
+        vutils.save_image(grid, self.save_dir / f'{prefix}_samples_step_{self.step}.png')
+
+        # Log sample to TensorBoard
+        self.logger.writer.add_image(f'{prefix}_samples', grid, self.step)
+
+    def check_training_quality(self) -> List[str]:
+        """Enhanced training quality checks."""
         issues = []
 
-        # Check if generator is learning
-        if len(self.g_losses) > 100:  # Wait for some training history
-            recent_g_loss = np.mean(self.g_losses[-20:])
-            if recent_g_loss > np.mean(self.g_losses[:20]):
-                issues.append("Generator loss is increasing")
+        if len(self.metrics['g_losses']) > 100:
+            recent_g_loss = np.mean(self.metrics['g_losses'][-20:])
+            initial_g_loss = np.mean(self.metrics['g_losses'][:20])
 
-            # Check for mode collapse
-            if np.std(self.g_losses[-20:]) < 0.01:
+            # Check various training issues
+            if recent_g_loss > initial_g_loss * 1.5:
+                issues.append("Generator loss is significantly increasing")
+
+            if np.std(self.metrics['g_losses'][-20:]) < 0.01:
                 issues.append("Possible mode collapse detected")
 
-            # Check discriminator dominance
-            if np.mean(self.d_losses[-20:]) < 0.1:
+            recent_d_loss = np.mean(self.metrics['d_losses'][-20:])
+            if recent_d_loss < 0.1:
                 issues.append("Discriminator may be too strong")
 
-            # Check vanishing gradients
-            if abs(recent_g_loss - self.g_losses[-2]) < 1e-7:
+            if abs(recent_g_loss - self.metrics['g_losses'][-2]) < 1e-7:
                 issues.append("Possible vanishing gradients")
+
+            # Resource-related issues
+            if self.resource_monitor.gpu_available:
+                recent_gpu_usage = np.mean(self.resource_monitor.metrics['gpu_usage'][-20:])
+                if recent_gpu_usage > 95:
+                    issues.append("GPU usage consistently very high")
+
+            recent_memory_usage = np.mean(self.resource_monitor.metrics['memory_usage'][-20:])
+            if recent_memory_usage > 90:
+                issues.append("System memory usage critically high")
 
         return issues
 
+    def save_checkpoint(self):
+        """Save all monitoring data to disk."""
+        checkpoint = {
+            'metrics': self.metrics,
+            'resource_metrics': self.resource_monitor.metrics,
+            'step': self.step
+        }
+        torch.save(checkpoint, self.save_dir / f'monitor_checkpoint_{self.step}.pt')
+
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]):
+        """Load monitoring data from a checkpoint."""
+        checkpoint = torch.load(checkpoint_path)
+        self.metrics = checkpoint['metrics']
+        self.resource_monitor.metrics = checkpoint['resource_metrics']
+        self.step = checkpoint['step']
 
 # Improved Generator Network with Self-Attention and Better Architecture
 class Generator(nn.Module):
@@ -327,40 +614,33 @@ class Generator(nn.Module):
         self.latent_dim = latent_dim
         self.num_classes = num_classes
 
-        # Improved label embedding with higher dimensionality
-        self.label_embedding = nn.Embedding(num_classes, 100)  # Increased from 50 to 100
+        self.label_embedding = nn.Embedding(num_classes, 100)
 
-        # Initial dense layer with improved capacity
         self.initial = nn.Sequential(
-            nn.Linear(latent_dim + 100, 512 * 8 * 8),  # Increased from 256 to 512
+            nn.Linear(latent_dim + 100, 512 * 8 * 8),
             nn.LeakyReLU(0.2),
             nn.BatchNorm1d(512 * 8 * 8),
-            nn.Dropout(0.3)  # Add dropout for regularization
+            nn.Dropout(0.3)
         )
 
-        # Main convolutional layers
         self.conv_blocks = nn.ModuleList([
-            # 8x8 -> 16x16
             nn.Sequential(
                 nn.ConvTranspose2d(512, 256, 4, 2, 1),
                 nn.BatchNorm2d(256),
                 nn.LeakyReLU(0.2),
                 nn.Dropout2d(0.3)
             ),
-            # 16x16 -> 32x32
             nn.Sequential(
                 nn.ConvTranspose2d(256, 128, 4, 2, 1),
                 nn.BatchNorm2d(128),
                 nn.LeakyReLU(0.2),
                 nn.Dropout2d(0.3)
             ),
-            # 32x32 -> 64x64
             nn.Sequential(
                 nn.ConvTranspose2d(128, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.LeakyReLU(0.2)
             ),
-            # 64x64 -> 128x128
             nn.Sequential(
                 nn.ConvTranspose2d(64, 32, 4, 2, 1),
                 nn.BatchNorm2d(32),
@@ -368,16 +648,13 @@ class Generator(nn.Module):
             )
         ])
 
-        # Self-attention layer after second conv block
         self.attention = SelfAttention(128)
 
-        # Final layer
         self.final = nn.Sequential(
             nn.ConvTranspose2d(32, 3, 3, 1, 1),
             nn.Tanh()
         )
 
-        # Initialize weights for better training
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -519,6 +796,7 @@ class Discriminator(nn.Module):
 class AnimeGeneratorTrainer:
     def __init__(self, network_path: str, batch_size: int = 64, latent_dim: int = 100,
                  lr: float = 0.0002, image_size: int = 128, local_cache_dir: Optional[str] = None):
+        self.background_processor = BackgroundProcessor()
 
         # Check CUDA availability properly
         self.use_cuda = torch.cuda.is_available()
@@ -534,12 +812,10 @@ class AnimeGeneratorTrainer:
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
+        self.background_processor = BackgroundProcessor()
 
-        # Initialize dataset
-        logger.info(f"Initializing dataset from network path: {network_path}")
+        # Initialize dataset and dataloader
         self.dataset = AnimeDataset(network_path, image_size)
-
-        # Configure DataLoader
         num_workers = 4 if self.use_cuda else 0
         self.dataloader = DataLoader(
             self.dataset,
@@ -555,18 +831,18 @@ class AnimeGeneratorTrainer:
         self.generator = Generator(latent_dim, len(self.dataset.label_to_idx))
         self.discriminator = Discriminator(len(self.dataset.label_to_idx))
 
-        # Move models to appropriate device
+        # Move models to device
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
 
-        # Initialize optimizers
+        # Initialize optimizers with improved parameters
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr * 1.5, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
 
         self.criterion = nn.BCEWithLogitsLoss()
         self.real_label_val = 0.9
         self.fake_label_val = 0.0
-        self.monitor = TrainingMonitor()
+        self.monitor = EnhancedTrainingMonitor()
 
         # Log GPU memory usage after initialization
         if torch.cuda.is_available():
@@ -601,16 +877,18 @@ class AnimeGeneratorTrainer:
 
         return len(warnings) == 0  # Return True if training looks healthy
 
-    def generate_samples(self, num_samples, labels):
+    def generate_samples(self, num_samples, labels, background_type='smooth'):
+        """Generate samples with background processing"""
         self.generator.eval()
         with torch.no_grad():
-            noise = torch.randn(num_samples, self.latent_dim, device=self.device,
-                                dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
+            noise = torch.randn(num_samples, self.latent_dim, device=self.device)
             fake_images = self.generator(noise, labels)
-            if torch.cuda.is_available():
-                fake_images = fake_images.float()  # Convert back to float32 for display
+            processed_images = self.background_processor.process_image(
+                fake_images,
+                background_type=background_type
+            )
         self.generator.train()
-        return fake_images
+        return processed_images
 
     def load_checkpoint(self, checkpoint_path):
         """Load a checkpoint"""
@@ -650,13 +928,9 @@ class AnimeGeneratorTrainer:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    def train(self, num_epochs=100, save_interval=5):
+    def train(self, num_epochs=500, save_interval=5):
         # Initialize scaler for mixed precision training
-        scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
-
-        def noisy_labels(size, value):
-            return (torch.ones(size, 1, device=self.device) * value +
-                    torch.randn(size, 1, device=self.device) * 0.05)
+        scaler = torch.amp.GradScaler() if self.use_cuda else None
 
         for epoch in range(num_epochs):
             running_d_loss = 0.0
@@ -664,69 +938,24 @@ class AnimeGeneratorTrainer:
 
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, (real_images, labels) in enumerate(pbar):
-                batch_size = real_images.size(0)
-
                 # Move data to device
                 real_images = real_images.to(self.device)
                 labels = labels.to(self.device)
 
-                # Train Discriminator
-                self.d_optimizer.zero_grad()
-
-                with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
-                    # Real images
-                    label_real = noisy_labels(batch_size, self.real_label_val)
-                    output_real = self.discriminator(real_images, labels)
-                    d_loss_real = self.criterion(output_real, label_real)
-
-                    # Fake images
-                    noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-                    fake_images = self.generator(noise, labels)
-                    label_fake = noisy_labels(batch_size, self.fake_label_val)
-                    output_fake = self.discriminator(fake_images.detach(), labels)
-                    d_loss_fake = self.criterion(output_fake, label_fake)
-
-                    d_loss = (d_loss_real + d_loss_fake) * 0.5
-
-                if self.use_cuda:
-                    scaler.scale(d_loss).backward()
-                    scaler.step(self.d_optimizer)
-                    scaler.update()
-                else:
-                    d_loss.backward()
-                    self.d_optimizer.step()
-
-                # Train Generator
-                if batch_idx % 2 == 0:
-                    self.g_optimizer.zero_grad()
-
-                    with torch.amp.autocast(device_type='cuda' if self.use_cuda else 'cpu', dtype=torch.float32):
-                        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-                        fake_images = self.generator(noise, labels)
-                        output_fake = self.discriminator(fake_images, labels)
-                        g_loss = self.criterion(output_fake, label_real)
-
-                    if self.use_cuda:
-                        scaler.scale(g_loss).backward()
-                        scaler.step(self.g_optimizer)
-                        scaler.update()
-                    else:
-                        g_loss.backward()
-                        self.g_optimizer.step()
-                else:
-                    g_loss = torch.tensor(0.0, device=self.device)
+                # Use the train_step method instead of separate G and D training
+                d_loss, g_loss = self.train_step(real_images, labels)
 
                 # Update running losses
-                running_d_loss += d_loss.item()
-                running_g_loss += g_loss.item()
+                running_d_loss += d_loss
+                running_g_loss += g_loss
 
                 if batch_idx % 10 == 0:
-                    self.monitor.update(g_loss.item(), d_loss.item())
+                    self.monitor.update(g_loss, d_loss)
 
-                    # Add health monitoring here
+                    # Add health monitoring
                     training_healthy = self.monitor_training_health(
-                        g_loss.item(),
-                        d_loss.item(),
+                        g_loss,
+                        d_loss,
                         epoch + 1,
                         batch_idx
                     )
@@ -740,8 +969,8 @@ class AnimeGeneratorTrainer:
 
                     # Update progress bar
                     status = {
-                        'D_loss': f"{d_loss.item():.4f}",
-                        'G_loss': f"{g_loss.item():.4f}",
+                        'D_loss': f"{d_loss:.4f}",
+                        'G_loss': f"{g_loss:.4f}",
                         'Healthy': training_healthy
                     }
 
@@ -751,33 +980,80 @@ class AnimeGeneratorTrainer:
 
                     pbar.set_postfix(status)
 
-            # Save progress
+                # Save progress
+                if (batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1):
+                    with torch.no_grad():
+                        # Generate samples with different backgrounds
+                        num_samples = min(4, len(self.dataset.label_to_idx))
+                        sample_labels = torch.arange(num_samples, device=self.device)
+
+                        for bg_type in ['smooth', 'gradient', 'pattern']:
+                            generated_images = self.generate_samples(
+                                num_samples,
+                                sample_labels,
+                                background_type=bg_type
+                            )
+                            self.monitor.save_samples(
+                                generated_images,
+                                epoch + 1,
+                                prefix=f'progress_{bg_type}_bg'
+                            )
+
+            # Save checkpoint at interval
             if (epoch + 1) % save_interval == 0:
                 self.save_checkpoint(epoch + 1)
-                with torch.no_grad():
-                    num_samples = min(4, len(self.dataset.label_to_idx))
-                    sample_labels = torch.arange(num_samples, device=self.device)
-                    fake_images = self.generate_samples(num_samples, sample_labels)
-                    self.monitor.save_samples(fake_images, epoch + 1)
-                    self.monitor.plot_losses(epoch + 1)
+                self.monitor.plot_losses(epoch + 1)
 
             avg_d_loss = running_d_loss / len(self.dataloader)
             avg_g_loss = running_g_loss / len(self.dataloader)
-            logger.info(f"Issues: {self.monitor.check_training_quality(self, g_loss, d_loss)}")
+            logger.info(f"Issues: {self.monitor.check_training_quality(avg_g_loss, avg_d_loss)}")
             logger.info(f"Epoch {epoch + 1} - Avg D_loss: {avg_d_loss:.4f}, Avg G_loss: {avg_g_loss:.4f}")
 
+    def train_step(self, real_images, labels):
+        """Modified training step with background processing"""
+        batch_size = real_images.size(0)
+
+        # Train discriminator
+        self.d_optimizer.zero_grad()
+
+        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
+        fake_images = self.generator(noise, labels)
+        processed_fake = self.background_processor.process_image(fake_images)
+
+        d_loss_real = self.criterion(
+            self.discriminator(real_images, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        d_loss_fake = self.criterion(
+            self.discriminator(processed_fake.detach(), labels),
+            torch.zeros(batch_size, 1, device=self.device)
+        )
+
+        d_loss = (d_loss_real + d_loss_fake) * 0.5
+        d_loss.backward()
+        self.d_optimizer.step()
+
+        # Train generator
+        self.g_optimizer.zero_grad()
+        g_loss = self.criterion(
+            self.discriminator(processed_fake, labels),
+            torch.ones(batch_size, 1, device=self.device) * self.real_label_val
+        )
+        g_loss.backward()
+        self.g_optimizer.step()
+
+        return d_loss.item(), g_loss.item()
 
 def main():
     # Configuration
     network_path = r"\\192.168.1.66\plex\hentai\processed_images"
-    local_cache_dir = "local_cache"  # Optional local cache directory
+    local_cache_dir = "local_cache"
     batch_size = 32
-    num_epochs = 100
+    num_epochs = 500
     save_interval = 5
     image_size = 128
     latent_dim = 100
 
-    # Initialize and train
     trainer = AnimeGeneratorTrainer(
         network_path=network_path,
         batch_size=batch_size,
@@ -786,22 +1062,29 @@ def main():
         local_cache_dir=local_cache_dir
     )
 
-    # Start training
     trainer.train(num_epochs=num_epochs, save_interval=save_interval)
 
-    # After training, generate samples
-    logger.info("Training completed. Generating sample images...")
+    # Generate samples with different backgrounds
+    logger.info("Generating sample images with different backgrounds...")
     trainer.load_checkpoint("checkpoints/best_model.pt")
 
-    # Generate samples for different characters
     num_samples = min(16, len(trainer.dataset.label_to_idx))
     sample_labels = torch.arange(num_samples).to(trainer.device)
-    generated_images = trainer.generate_samples(num_samples, sample_labels)
 
-    # Save final samples
-    trainer.monitor.save_samples(generated_images, epoch=num_epochs, prefix='final')
+    # Generate with different background types
+    for bg_type in ['smooth', 'gradient', 'pattern']:
+        generated_images = trainer.generate_samples(
+            num_samples,
+            sample_labels,
+            background_type=bg_type
+        )
+        trainer.monitor.save_samples(
+            generated_images,
+            num_epochs,
+            prefix=f'final_{bg_type}_bg'
+        )
+
     logger.info(f"Final samples saved to {trainer.monitor.save_dir}")
-
 
 if __name__ == "__main__":
     main()
