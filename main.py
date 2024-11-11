@@ -187,10 +187,50 @@ class AnimeDataset(Dataset):
 
         logger.info("Scanning network directory for images...")
         self._scan_directories()
+        logger.info(f"Initial scan found {len(self.image_paths)} images")
+
+        # Add recursive glob pattern to catch all subdirectories
+        self._scan_recursive()
+        logger.info(f"After recursive scan found {len(self.image_paths)} images")
+
         self._process_and_cache_images()
 
-    def _scan_directories(self):
-        """Scan directories with error handling for network issues"""
+    def _scan_recursive(self):
+        """Recursively scan all subdirectories for images"""
+        try:
+            # List of common image extensions
+            extensions = ['*.jpg', '*.jpeg', '*.png']
+
+            for ext in extensions:
+                # Use rglob to recursively search all subdirectories
+                for img_path in self.root_dir.rglob(ext):
+                    # Get relative path from root directory
+                    rel_path = img_path.relative_to(self.root_dir)
+                    parts = rel_path.parts
+
+                    # Need at least franchise/character structure
+                    if len(parts) >= 2:
+                        franchise = parts[0]
+                        character = parts[1]
+                        label = f"{franchise}/{character}"
+
+                        # Add to label mappings if new
+                        if label not in self.label_to_idx:
+                            idx = len(self.label_to_idx)
+                            self.label_to_idx[label] = idx
+                            self.idx_to_label[idx] = label
+
+                        # Add image path and label if not already present
+                        if img_path not in self.image_paths:
+                            self.image_paths.append(img_path)
+                            self.labels.append(self.label_to_idx[label])
+
+        except Exception as e:
+            logger.error(f"Error in recursive directory scan: {e}")
+            raise RuntimeError("Failed to scan directories recursively")
+
+    d def _scan_directories(self):
+        """Initial directory scan (kept for compatibility)"""
         try:
             for franchise_dir in self.root_dir.iterdir():
                 if franchise_dir.is_dir():
@@ -202,14 +242,11 @@ class AnimeDataset(Dataset):
                                 self.label_to_idx[label] = idx
                                 self.idx_to_label[idx] = label
 
+                            # Add only top-level images
                             for img_path in char_dir.glob("*.[jp][pn][g]"):
-                                self.image_paths.append(img_path)
-                                self.labels.append(self.label_to_idx[label])
-
-            if not self.image_paths:
-                raise RuntimeError("No images found in the specified directory")
-
-            logger.info(f"Found {len(self.image_paths)} images across {len(self.label_to_idx)} categories")
+                                if img_path not in self.image_paths:
+                                    self.image_paths.append(img_path)
+                                    self.labels.append(self.label_to_idx[label])
 
         except Exception as e:
             logger.error(f"Error scanning network directory: {e}")
