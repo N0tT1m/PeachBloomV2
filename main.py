@@ -165,8 +165,8 @@ class AnimeDataset(Dataset):
         self.remove_bg = remove_bg
         self.store_originals = store_originals
 
-        # Initialize rembg session with u2net model
-        self.rembg_session = new_session("u2net")
+        # Don't initialize rembg session here
+        self.rembg_session = None
 
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -189,11 +189,19 @@ class AnimeDataset(Dataset):
         self._scan_directories()
         logger.info(f"Initial scan found {len(self.image_paths)} images")
 
-        # Add recursive glob pattern to catch all subdirectories
         self._scan_recursive()
         logger.info(f"After recursive scan found {len(self.image_paths)} images")
 
+        # Pre-process images in the main process
         self._process_and_cache_images()
+
+    def _get_rembg_session(self):
+        """Lazily initialize rembg session when needed"""
+        if self.rembg_session is None:
+            self.rembg_session = new_session("u2net")
+        return self.rembg_session
+
+
 
     def _scan_recursive(self):
         """Recursively scan all subdirectories for images"""
@@ -274,11 +282,14 @@ class AnimeDataset(Dataset):
                     # Convert to RGBA for transparency
                     img_rgba = img.convert('RGBA')
 
-                    # Use rembg with modified parameters to avoid Cholesky decomposition issues
+                    # Get session in current process
+                    session = self._get_rembg_session()
+
+                    # Use rembg with modified parameters
                     nobg_img = remove(
                         img_rgba,
-                        session=self.rembg_session,
-                        alpha_matting=False,  # Disable alpha matting to avoid Cholesky decomposition
+                        session=session,
+                        alpha_matting=False,
                         only_mask=False,
                         post_process_mask=True
                     )
@@ -295,6 +306,13 @@ class AnimeDataset(Dataset):
 
                 nobg_img.save(nobg_cache_path)
                 return orig_img, nobg_img
+
+        except Exception as e:
+            logger.warning(f"Failed to remove background from {img_path}: {e}")
+            # Return original image for both if processing fails
+            with Image.open(img_path) as img:
+                orig_img = img.convert('RGB')
+                return orig_img, orig_img
 
         except Exception as e:
             logger.warning(f"Failed to remove background from {img_path}: {e}")
@@ -407,7 +425,7 @@ class AnimeDataset(Dataset):
                 if self.store_originals:
                     # Return both original and no-background versions
                     orig_img = Image.open(orig_cache_path)
-                    nobg_img = Image.open(nobg_cache_dir)
+                    nobg_img = Image.open(nobg_cache_path)
 
                     # Apply transformations
                     orig_tensor = self.transform(orig_img)
