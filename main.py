@@ -951,6 +951,9 @@ class AnimeGeneratorTrainer:
         self.fake_label_val = 0.0
         self.monitor = EnhancedTrainingMonitor()
 
+        self.samples_dir = Path("generated_samples")
+        self.samples_dir.mkdir(exist_ok=True)
+
         # Log GPU memory usage after initialization
         if torch.cuda.is_available():
             logger.info(f"GPU Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
@@ -983,6 +986,45 @@ class AnimeGeneratorTrainer:
             logger.warning(f"Epoch {epoch}, Batch {batch_idx}: {'; '.join(warnings)}")
 
         return len(warnings) == 0  # Return True if training looks healthy
+
+    def save_samples(self, epoch: int, batch_idx: int, num_samples: int = 16):
+        """Generate and save sample images during training"""
+        try:
+            # Create directory for this epoch if it doesn't exist
+            epoch_dir = self.samples_dir / f"epoch_{epoch}"
+            epoch_dir.mkdir(exist_ok=True)
+
+            # Generate random labels for sampling
+            sample_size = min(num_samples, len(self.dataset.label_to_idx))
+            random_labels = torch.randint(0, len(self.dataset.label_to_idx), (sample_size,)).to(self.device)
+
+            # Generate samples
+            self.generator.eval()
+            with torch.no_grad():
+                # Generate latent vectors
+                latent_vectors = torch.randn(sample_size, self.latent_dim, device=self.device)
+
+                # Generate fake images
+                fake_samples = self.generator(latent_vectors, random_labels)
+
+                # Process with background if needed
+                processed_samples = self.background_processor.process_image(fake_samples)
+
+                # Make grid of images
+                grid = vutils.make_grid(processed_samples, padding=2, normalize=True)
+
+                # Save the grid
+                save_path = epoch_dir / f"samples_batch_{batch_idx}.png"
+                vutils.save_image(grid, save_path)
+
+                # Log to monitor
+                self.monitor.save_samples(processed_samples, prefix=f'epoch_{epoch}_batch_{batch_idx}')
+
+            self.generator.train()
+            logger.info(f"Saved samples to {save_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save samples: {e}")
 
     def generate_samples(self, num_samples, labels, background_type='smooth'):
         """Generate samples with background processing"""
@@ -1110,6 +1152,7 @@ class AnimeGeneratorTrainer:
 
                     pbar.set_postfix(status)
 
+                # Save samples periodically
                 if batch_idx % 100 == 0 or batch_idx == len(self.dataloader) - 1:
                     self.save_samples(epoch, batch_idx)
 
